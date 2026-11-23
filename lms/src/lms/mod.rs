@@ -10,7 +10,7 @@ pub mod signature;
 pub use modes::{
     LmsMode, LmsSha256M32H5, LmsSha256M32H10, LmsSha256M32H15, LmsSha256M32H20, LmsSha256M32H25,
 };
-pub use private::SigningKey;
+pub use private::{SigningContext, SigningKey};
 pub use public::VerifyingKey;
 pub use signature::Signature;
 

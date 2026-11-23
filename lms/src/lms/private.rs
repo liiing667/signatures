@@ -21,11 +21,25 @@ use typenum::{Sum, U28};
 /// LM-OTS algorithms so it must be parametrized. With the algorithms provided
 /// by this crate, this is done via
 /// [LmsSha256M32H10](crate::lms::LmsSha256M32H10)<[LmsOtsSha256N32W4](crate::ots::LmsOtsSha256N32W4)>.
+///
+/// Signing is structured as a transaction around the signing index `q`:
+/// [`SigningKey::reserve_index`] hands out a unique index, the OTS signature
+/// is produced for exactly that index with [`SigningKey::sign_reserved`] (or
+/// through a shared [`SigningContext`]), and if signing fails before a
+/// signature was released the index is returned to the key with
+/// [`SigningKey::recover_index`] so the leaf private key is neither burned
+/// nor reused. The `RandomizedSignerMut`/`RandomizedMultipartSignerMut`
+/// impls perform this transaction internally, so sequential signing is
+/// unchanged.
 pub struct SigningKey<Mode: LmsMode> {
     id: Identifier,
     seed: Output<Mode::Hasher>, // Re-generate the leaf privkeys as-needed from a seed
     auth_tree: Array<Output<Mode::Hasher>, Mode::TreeLen>, // TODO: Decide whether/when to precompute
     q: u32,
+    // Indices whose signing attempt failed before a signature was released.
+    // They are handed out again by `reserve_index` before `q` is advanced,
+    // so a transient failure neither burns a leaf nor reuses one.
+    recovered: Vec<u32>,
 }
 
 impl<Mode: LmsMode> SigningKey<Mode> {
@@ -54,6 +68,7 @@ impl<Mode: LmsMode> SigningKey<Mode> {
             seed,
             auth_tree: Array::default(),
             q: 0, // we set q = 0 when generating keys; it will change
+            recovered: Vec::new(),
         };
         sk.gen_pk_tree(); // TODO: Use lazy generation / MTT
         Ok(sk)
@@ -101,6 +116,166 @@ impl<Mode: LmsMode> SigningKey<Mode> {
     pub fn q(&self) -> u32 {
         self.q
     }
+
+    /// Returns the reserved indices currently held in the recovery pool,
+    /// i.e. indices whose signing attempt failed before a signature was
+    /// released and which will be handed out again by
+    /// [`SigningKey::reserve_index`] before `q` is advanced.
+    pub fn recovered_indices(&self) -> &[u32] {
+        &self.recovered
+    }
+
+    /// Reserves the next signing index, transactionally advancing the key
+    /// state.
+    ///
+    /// Each successful call returns an index that no concurrent call can
+    /// also observe, so two signers never read the same `q`. Indices
+    /// returned via [`SigningKey::recover_index`] are handed out again
+    /// before `q` is advanced.
+    ///
+    /// Once a signature produced for the reserved index has been released,
+    /// the index must stay consumed. If signing fails before any signature
+    /// is released, the index should be returned with
+    /// [`SigningKey::recover_index`].
+    ///
+    /// Returns [`LmsOutOfPrivateKeys`] when all `2^h` indices are exhausted.
+    pub fn reserve_index(&mut self) -> Result<u32, Error> {
+        if let Some(q) = self.recovered.pop() {
+            return Ok(q);
+        }
+        if self.q >= Mode::LEAVES {
+            return Err(Error::from_source(LmsOutOfPrivateKeys {}));
+        }
+        let q = self.q;
+        self.q += 1;
+        Ok(q)
+    }
+
+    /// Returns a previously reserved index to the key after the signing
+    /// attempt for it failed *before any signature produced with it was
+    /// released*. The index will be handed out again by
+    /// [`SigningKey::reserve_index`].
+    ///
+    /// Recovering an index whose signature was (or may have been) released
+    /// would cause the leaf private key to be reused and is a contract
+    /// violation. When in doubt, burn the index instead of recovering it.
+    ///
+    /// Indices that were never reserved or are already recovered are
+    /// ignored. Recovered indices are not part of the serialized key
+    /// representation; exporting the key conservatively burns them.
+    pub fn recover_index(&mut self, q: u32) {
+        if q < self.q && !self.recovered.contains(&q) {
+            self.recovered.push(q);
+        }
+    }
+
+    /// Produces a signature for the previously reserved index `q` without
+    /// modifying the key's index state.
+    ///
+    /// Together with [`SigningKey::reserve_index`] and
+    /// [`SigningKey::recover_index`] this forms the `q` transaction:
+    /// reserve an index, sign with it, and recover it if signing fails
+    /// before the signature is released.
+    pub fn sign_reserved<R: TryCryptoRng + ?Sized>(
+        &self,
+        rng: &mut R,
+        msg: &[&[u8]],
+        q: u32,
+    ) -> Result<Signature<Mode>, Error> {
+        sign_with_index(&self.id, &self.seed, &self.auth_tree, rng, msg, q)
+    }
+
+    /// Returns an immutable snapshot of the key material needed to sign
+    /// with reserved indices.
+    ///
+    /// The context can be cloned and shared between threads (e.g. behind an
+    /// `Arc`) while the `SigningKey` itself stays behind a `Mutex` that is
+    /// only locked briefly to reserve or recover indices. This way
+    /// concurrent signers never read the same `q`, and a failed attempt
+    /// never advances the index past a leaf whose signature was released.
+    pub fn signing_context(&self) -> SigningContext<Mode> {
+        SigningContext {
+            id: self.id,
+            seed: self.seed.clone(),
+            auth_tree: self.auth_tree.clone(),
+        }
+    }
+}
+
+/// Immutable snapshot of a [`SigningKey`]'s key material, used to produce
+/// signatures for indices reserved through [`SigningKey::reserve_index`].
+///
+/// A context cannot reserve indices on its own, so sharing it between
+/// threads is safe: every signature is still tied to the `q` transaction
+/// of the owning [`SigningKey`]. Signatures produced with a context verify
+/// against [`SigningContext::public`].
+pub struct SigningContext<Mode: LmsMode> {
+    id: Identifier,
+    seed: Output<Mode::Hasher>,
+    auth_tree: Array<Output<Mode::Hasher>, Mode::TreeLen>,
+}
+
+// manual implementation is required to not require bounds on Mode
+impl<Mode: LmsMode> Clone for SigningContext<Mode> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            seed: self.seed.clone(),
+            auth_tree: self.auth_tree.clone(),
+        }
+    }
+}
+
+impl<Mode: LmsMode> SigningContext<Mode> {
+    /// Returns the 16-byte identifier of the key pair
+    pub fn id(&self) -> &Identifier {
+        &self.id
+    }
+
+    /// Returns the public key that signatures produced with this context
+    /// verify against
+    pub fn public(&self) -> VerifyingKey<Mode> {
+        VerifyingKey::<Mode>::new(self.id, self.auth_tree[0].clone())
+    }
+
+    /// Produces a signature for the reserved index `q`; see
+    /// [`SigningKey::sign_reserved`].
+    pub fn sign_reserved<R: TryCryptoRng + ?Sized>(
+        &self,
+        rng: &mut R,
+        msg: &[&[u8]],
+        q: u32,
+    ) -> Result<Signature<Mode>, Error> {
+        sign_with_index(&self.id, &self.seed, &self.auth_tree, rng, msg, q)
+    }
+}
+
+// this implements the algorithm from Appendix D in <https://datatracker.ietf.org/doc/html/rfc8554#appendix-D>
+// for a single, previously reserved index
+fn sign_with_index<Mode: LmsMode, R: TryCryptoRng + ?Sized>(
+    id: &Identifier,
+    seed: &Output<Mode::Hasher>,
+    auth_tree: &Array<Output<Mode::Hasher>, Mode::TreeLen>,
+    rng: &mut R,
+    msg: &[&[u8]],
+    q: u32,
+) -> Result<Signature<Mode>, Error> {
+    if q >= Mode::LEAVES {
+        return Err(Error::from_source(LmsOutOfPrivateKeys {}));
+    }
+
+    let mut ots_priv_key = OtsPrivateKey::<Mode::OtsMode>::new_from_seed(q, *id, seed);
+    let ots_sig = ots_priv_key.try_multipart_sign_with_rng(rng, msg)?;
+
+    let r = (1 << Mode::H) + q;
+
+    let auth_path = (0..Mode::H).map(|i| auth_tree[(((r >> i) ^ 1) - 1) as usize].clone());
+
+    Ok(Signature::<Mode> {
+        q,
+        lmots_sig: ots_sig,
+        path: auth_path.collect(),
+    })
 }
 
 // this implements the algorithm from Appendix D in <https://datatracker.ietf.org/doc/html/rfc8554#appendix-D>
@@ -121,26 +296,17 @@ impl<Mode: LmsMode> RandomizedMultipartSignerMut<Signature<Mode>> for SigningKey
         rng: &mut R,
         msg: &[&[u8]],
     ) -> Result<Signature<Mode>, Error> {
-        if self.q >= Mode::LEAVES {
-            return Err(Error::from_source(LmsOutOfPrivateKeys {}));
+        // q transaction: reserve the index up front, sign with exactly that
+        // index, and recover it if signing fails before a signature was
+        // released, so the leaf private key is neither burned nor reused
+        let q = self.reserve_index()?;
+        match self.sign_reserved(rng, msg, q) {
+            Ok(sig) => Ok(sig),
+            Err(e) => {
+                self.recover_index(q);
+                Err(e)
+            }
         }
-
-        let mut ots_priv_key =
-            OtsPrivateKey::<Mode::OtsMode>::new_from_seed(self.q, self.id, &self.seed);
-        let ots_sig = ots_priv_key.try_multipart_sign_with_rng(rng, msg)?;
-
-        let r = (1 << Mode::H) + self.q;
-
-        let auth_path = (0..Mode::H).map(|i| self.auth_tree[(((r >> i) ^ 1) - 1) as usize].clone());
-
-        // increment q
-        self.q += 1;
-
-        Ok(Signature::<Mode> {
-            q: self.q - 1,
-            lmots_sig: ots_sig,
-            path: auth_path.collect(),
-        })
     }
 }
 
@@ -201,6 +367,9 @@ impl<'a, Mode: LmsMode> TryFrom<&'a [u8]> for SigningKey<Mode> {
                     id: id.try_into().expect("ok"),
                     seed: Array::try_from(seed).expect("ok"),
                     auth_tree: Array::default(),
+                    // recovered indices are not serialized; on restore they
+                    // are conservatively burned (they are all < q)
+                    recovered: Vec::new(),
                 };
                 key.gen_pk_tree();
                 Ok(key)
@@ -212,11 +381,127 @@ impl<'a, Mode: LmsMode> TryFrom<&'a [u8]> for SigningKey<Mode> {
 #[cfg(test)]
 mod tests {
     use super::{SigningKey, VerifyingKey};
+    use crate::constants::D_LEAF;
     use crate::lms::modes::{LmsSha256M32H5, LmsSha256M32H10};
+    use crate::lms::{LmsMode, Signature};
+    use crate::ots::SigningKey as OtsPrivateKey;
     use crate::ots::modes::{LmsOtsSha256N32W4, LmsOtsSha256N32W8};
+    use digest::Digest;
     use hex_literal::hex;
     use hybrid_array::Array;
-    use signature::{RandomizedSignerMut, SignatureEncoding};
+    use rand_core::{TryCryptoRng, TryRng};
+    use sha2::Sha256;
+    use signature::{RandomizedSignerMut, SignatureEncoding, Verifier};
+    use std::convert::Infallible;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    /// Deterministic RNG for tests (splitmix64). NOT cryptographically secure.
+    struct TestRng(u64);
+
+    impl TryRng for TestRng {
+        type Error = Infallible;
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+            for chunk in dest.chunks_mut(8) {
+                self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                chunk.copy_from_slice(&z.to_le_bytes()[..chunk.len()]);
+            }
+            Ok(())
+        }
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            let mut buf = [0; 4];
+            self.try_fill_bytes(&mut buf)?;
+            Ok(u32::from_le_bytes(buf))
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            let mut buf = [0; 8];
+            self.try_fill_bytes(&mut buf)?;
+            Ok(u64::from_le_bytes(buf))
+        }
+    }
+
+    impl TryCryptoRng for TestRng {}
+
+    /// Error returned by the failing test RNGs
+    #[derive(Debug)]
+    struct TestRngError;
+
+    impl core::fmt::Display for TestRngError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "test RNG failure")
+        }
+    }
+
+    impl std::error::Error for TestRngError {}
+
+    /// RNG that fails on every call
+    struct FailingRng;
+
+    impl TryRng for FailingRng {
+        type Error = TestRngError;
+
+        fn try_fill_bytes(&mut self, _dest: &mut [u8]) -> Result<(), Self::Error> {
+            Err(TestRngError)
+        }
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Err(TestRngError)
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Err(TestRngError)
+        }
+    }
+
+    impl TryCryptoRng for FailingRng {}
+
+    /// RNG that fails every third call to `try_fill_bytes`
+    struct FlakyRng {
+        inner: TestRng,
+        call: u64,
+    }
+
+    impl FlakyRng {
+        fn new(seed: u64) -> Self {
+            Self {
+                inner: TestRng(seed),
+                call: 0,
+            }
+        }
+    }
+
+    impl TryRng for FlakyRng {
+        type Error = TestRngError;
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+            self.call += 1;
+            if self.call % 3 == 0 {
+                return Err(TestRngError);
+            }
+            self.inner.try_fill_bytes(dest).map_err(|e| match e {})
+        }
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            let mut buf = [0; 4];
+            self.try_fill_bytes(&mut buf)?;
+            Ok(u32::from_le_bytes(buf))
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            let mut buf = [0; 8];
+            self.try_fill_bytes(&mut buf)?;
+            Ok(u64::from_le_bytes(buf))
+        }
+    }
+
+    impl TryCryptoRng for FlakyRng {}
 
     // Known-Answer Test vectors from <https://datatracker.ietf.org/doc/html/rfc8554#appendix-F>
     #[test]
@@ -409,5 +694,172 @@ mod tests {
 
         assert_eq!(lms_pub.k(), expected_k);
         assert_eq!(lms_pub.id(), &id);
+    }
+
+    #[test]
+    // Index reservation and recovery form the q transaction: reserved
+    // indices are unique, recovered indices are reused before q advances,
+    // and invalid recoveries are ignored.
+    fn test_index_reservation_and_recovery() {
+        type Mode = LmsSha256M32H5<LmsOtsSha256N32W4>;
+        let seed = hex!("558b8966c48ae9cb898b423c83443aae014a72f1b1ab5cc85cf1d892903b5439");
+        let id = hex!("d08fabd4a2091ff0a8cb4ed834e74534");
+        let mut sk = SigningKey::<Mode>::new_from_seed(id, seed).unwrap();
+
+        // reservations advance q and are unique
+        assert_eq!(sk.reserve_index().unwrap(), 0);
+        assert_eq!(sk.reserve_index().unwrap(), 1);
+        assert_eq!(sk.q(), 2);
+
+        // recovered indices are handed out again (most recently recovered
+        // first) before q is advanced
+        sk.recover_index(0);
+        sk.recover_index(1);
+        assert_eq!(sk.recovered_indices(), &[0, 1]);
+        assert_eq!(sk.reserve_index().unwrap(), 1);
+        assert_eq!(sk.reserve_index().unwrap(), 0);
+        assert_eq!(sk.q(), 2);
+        assert!(sk.recovered_indices().is_empty());
+
+        // indices that were never reserved or are already recovered are
+        // ignored
+        sk.recover_index(7);
+        sk.recover_index(0);
+        sk.recover_index(0);
+        assert_eq!(sk.recovered_indices(), &[0]);
+        assert_eq!(sk.reserve_index().unwrap(), 0);
+
+        // exhaustion: all leaves reserved
+        sk.q = Mode::LEAVES;
+        assert!(sk.reserve_index().is_err());
+        // a recovered index can still be handed out
+        sk.recover_index(5);
+        assert_eq!(sk.reserve_index().unwrap(), 5);
+        assert!(sk.reserve_index().is_err());
+    }
+
+    #[test]
+    // A failed signing attempt must neither burn the leaf nor reuse it:
+    // the reserved index is recovered and the retry signs with the same q.
+    fn test_failed_signing_recovers_index() {
+        type Mode = LmsSha256M32H5<LmsOtsSha256N32W4>;
+        let seed = hex!("558b8966c48ae9cb898b423c83443aae014a72f1b1ab5cc85cf1d892903b5439");
+        let id = hex!("d08fabd4a2091ff0a8cb4ed834e74534");
+        let msg: &[u8] = b"failure recovery test";
+
+        let mut sk = SigningKey::<Mode>::new_from_seed(id, seed).unwrap();
+        let pk = sk.public();
+
+        // signing fails before the OTS signature is produced
+        assert!(sk.try_sign_with_rng(&mut FailingRng, msg).is_err());
+        // the index was not burned: q did not advance and 0 waits for reuse
+        assert_eq!(sk.q(), 0);
+        assert_eq!(sk.recovered_indices(), &[0]);
+
+        // the retry reuses the recovered index instead of advancing q
+        let mut rng = TestRng(1);
+        let sig = sk.try_sign_with_rng(&mut rng, msg).unwrap();
+        assert_eq!(sig.q, 0);
+        assert_eq!(sk.q(), 1);
+        assert!(sk.recovered_indices().is_empty());
+        pk.verify(msg, &sig).unwrap();
+
+        // the next signature uses a fresh index
+        let sig = sk.try_sign_with_rng(&mut rng, msg).unwrap();
+        assert_eq!(sig.q, 1);
+        assert_eq!(sk.q(), 2);
+        pk.verify(msg, &sig).unwrap();
+    }
+
+    #[test]
+    // Concurrent signing around the q transaction: threads reserve indices
+    // under the lock, sign outside the lock through a shared context, and
+    // recover the index on failure. Afterwards the q values, the signature
+    // leaves and the recovery state must be consistent.
+    fn test_concurrent_signing_q_transaction() {
+        type Mode = LmsSha256M32H5<LmsOtsSha256N32W4>;
+        const THREADS: u64 = 4;
+        const SIGS_PER_THREAD: usize = 6;
+        const TOTAL: u32 = (THREADS as usize * SIGS_PER_THREAD) as u32;
+
+        let seed = hex!("558b8966c48ae9cb898b423c83443aae014a72f1b1ab5cc85cf1d892903b5439");
+        let id = hex!("d08fabd4a2091ff0a8cb4ed834e74534");
+        let msg: &[u8] = b"concurrent LMS signing test";
+
+        let sk = SigningKey::<Mode>::new_from_seed(id, seed).unwrap();
+        let pk = sk.public();
+
+        let ctx = sk.signing_context();
+        assert_eq!(ctx.public(), pk);
+        let ctx = Arc::new(ctx);
+        let key = Arc::new(Mutex::new(sk));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let key = Arc::clone(&key);
+                let ctx = Arc::clone(&ctx);
+                thread::spawn(move || {
+                    let mut rng = FlakyRng::new(t + 1);
+                    let mut signed = Vec::new();
+                    while signed.len() < SIGS_PER_THREAD {
+                        // q transaction: reserve under the lock ...
+                        let q = key.lock().unwrap().reserve_index().unwrap();
+                        // ... sign outside the lock through the shared
+                        // context ...
+                        match ctx.sign_reserved(&mut rng, &[msg], q) {
+                            Ok(sig) => {
+                                assert_eq!(sig.q, q);
+                                signed.push((q, sig));
+                            }
+                            // ... and recover the index if signing failed
+                            Err(_) => key.lock().unwrap().recover_index(q),
+                        }
+                    }
+                    signed
+                })
+            })
+            .collect();
+
+        let mut signed: Vec<(u32, Signature<Mode>)> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+
+        let sk = key.lock().unwrap();
+
+        // every signature was produced for a distinct q
+        signed.sort_by_key(|(q, _)| *q);
+        let qs: Vec<u32> = signed.iter().map(|(q, _)| *q).collect();
+        let mut deduped = qs.clone();
+        deduped.dedup();
+        assert_eq!(qs, deduped, "q reused between signatures");
+
+        // the signed indices and the recovery pool exactly cover 0..q:
+        // no leaf was burned by a failed attempt and none was used twice
+        let mut covered: Vec<u32> = qs
+            .iter()
+            .copied()
+            .chain(sk.recovered_indices().iter().copied())
+            .collect();
+        covered.sort_unstable();
+        assert_eq!(covered, (0..sk.q()).collect::<Vec<u32>>());
+        assert_eq!(sk.q(), TOTAL);
+        assert!(sk.recovered_indices().is_empty());
+
+        // every signature verifies under the public key and its leaf
+        // matches the tree leaf for its q
+        for (q, sig) in &signed {
+            pk.verify(msg, sig).unwrap();
+
+            let ots_priv =
+                OtsPrivateKey::<<Mode as LmsMode>::OtsMode>::new_from_seed(*q, sk.id, &sk.seed);
+            let leaf = Sha256::new()
+                .chain_update(sk.id)
+                .chain_update((*q + Mode::LEAVES).to_be_bytes())
+                .chain_update(D_LEAF)
+                .chain_update(ots_priv.public().k)
+                .finalize();
+            assert_eq!(sk.auth_tree[(Mode::LEAVES - 1 + *q) as usize], leaf);
+        }
     }
 }

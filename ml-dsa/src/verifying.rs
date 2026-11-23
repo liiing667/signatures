@@ -1,7 +1,7 @@
 //! ML-DSA signature verification.
 
 use crate::{
-    B32, B64, EncodedVerifyingKey, MlDsaParams, MuBuilder, Signature,
+    B32, B64, EncodedSignature, EncodedVerifyingKey, MlDsaParams, Mu, MuBuilder, Signature,
     algebra::{Elem, NttMatrix, NttVector, Vector},
     crypto::H,
     ntt::{Ntt, NttInverse},
@@ -79,6 +79,10 @@ impl<P: MlDsaParams> VerifyingKey<P> {
 
     /// Computes µ according to FIPS 204 for use in `ML-DSA.Sign` and `ML-DSA.Verify`.
     ///
+    /// The returned [`Mu`] is bound to this verifying key and to `ctx`. It can be passed to
+    /// [`VerifyingKey::verify_mu`], [`VerifyingKey::verify_mu_with_context`], or to the
+    /// `sign_mu_*` methods on the corresponding [`crate::ExpandedSigningKey`].
+    ///
     /// # Errors
     /// Returns [`Error`] if the context string is more than 255 bytes long or the given `Mp`
     /// returns one. An oversized context is rejected before `Mp` is called.
@@ -86,14 +90,14 @@ impl<P: MlDsaParams> VerifyingKey<P> {
         &self,
         Mp: F,
         ctx: &[u8],
-    ) -> Result<B64, Error> {
+    ) -> Result<Mu<P>, Error> {
         if ctx.len() > 255 {
             return Err(Error::new());
         }
 
         let mut mu = MuBuilder::new(&self.precomputed_values.tr, ctx);
         Mp(mu.as_mut())?;
-        Ok(mu.finish())
+        Ok(Mu::new(mu.finish(), self.precomputed_values.tr.clone(), ctx))
     }
 
     /// Implementation of Algorithm 8: `ML-DSA.Verify_internal` algorithm from FIPS 204.
@@ -138,8 +142,72 @@ impl<P: MlDsaParams> VerifyingKey<P> {
     }
 
     /// Implementation of Algorithm 3: `ML-DSA.Verify` from FIPS 204 with a pre-computed μ.
-    pub fn verify_mu(&self, mu: &B64, sigma: &Signature<P>) -> bool {
-        self.raw_verify_mu(mu, sigma)
+    ///
+    /// The supplied [`Mu`] must have been produced by [`VerifyingKey::compute_mu`] on this key.
+    /// A `µ` computed for another verifying key is rejected rather than being combined with this
+    /// key's public values.
+    ///
+    /// This method does not take a context string: the context is the one bound into `mu` when it
+    /// was computed. Use [`VerifyingKey::verify_mu_with_context`] when a cached `µ` could be
+    /// reused with a different context.
+    pub fn verify_mu(&self, mu: &Mu<P>, sigma: &Signature<P>) -> bool {
+        if !mu.is_bound_to(&self.precomputed_values.tr) {
+            return false;
+        }
+
+        self.raw_verify_mu(mu.as_bytes(), sigma)
+    }
+
+    /// Implementation of Algorithm 3: `ML-DSA.Verify` from FIPS 204 with a pre-computed μ and an
+    /// explicit context string.
+    ///
+    /// In addition to the key-identity check performed by [`VerifyingKey::verify_mu`], this
+    /// method verifies that `mu` was computed for `ctx`. This is the appropriate entry point when
+    /// a cached `µ` is reused across verification attempts: changing the context invalidates the
+    /// cached value instead of silently accepting the old context.
+    pub fn verify_mu_with_context(&self, mu: &Mu<P>, ctx: &[u8], sigma: &Signature<P>) -> bool {
+        if ctx.len() > 255
+            || !mu.is_bound_to(&self.precomputed_values.tr)
+            || !mu.matches_context(ctx)
+        {
+            return false;
+        }
+
+        self.raw_verify_mu(mu.as_bytes(), sigma)
+    }
+
+    /// Verify an encoded signature, decoding it before verification.
+    ///
+    /// Decoding and verification are bound together so that a signature is only used when its
+    /// `c̃`, `z` and hint encodings are all valid for this parameter set.
+    pub fn verify_encoded_with_context(
+        &self,
+        M: &[u8],
+        ctx: &[u8],
+        sigma: &EncodedSignature<P>,
+    ) -> bool {
+        if ctx.len() > 255 {
+            return false;
+        }
+
+        Signature::<P>::decode(sigma)
+            .is_some_and(|sigma| self.verify_with_context(M, ctx, &sigma))
+    }
+
+    /// Verify a signature from its byte encoding, decoding it before verification.
+    ///
+    /// This is the byte-slice counterpart of [`VerifyingKey::verify_encoded_with_context`]. A
+    /// byte string of the wrong total length, or one whose hint/`z` encoding is malformed, is
+    /// rejected just like an invalid signature.
+    pub fn verify_bytes_with_context(&self, M: &[u8], ctx: &[u8], sigma: &[u8]) -> bool {
+        if ctx.len() > 255 {
+            return false;
+        }
+
+        EncodedSignature::<P>::try_from(sigma)
+            .ok()
+            .and_then(|sigma| Signature::<P>::decode(&sigma))
+            .is_some_and(|sigma| self.verify_with_context(M, ctx, &sigma))
     }
 
     fn raw_verify_with_context(&self, M: &[&[u8]], ctx: &[u8], sigma: &Signature<P>) -> bool {
@@ -148,7 +216,7 @@ impl<P: MlDsaParams> VerifyingKey<P> {
         }
 
         let mu = MuBuilder::new(&self.precomputed_values.tr, ctx).message(M);
-        self.verify_mu(&mu, sigma)
+        self.raw_verify_mu(&mu, sigma)
     }
 
     pub(crate) fn encode_internal(rho: &B32, t1: &Vector<P::K>) -> EncodedVerifyingKey<P> {

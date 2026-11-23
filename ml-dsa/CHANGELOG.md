@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+### Added
+- `ExpandedSigningKey::compute_mu` for computing a key- and context-bound `µ` on the signing
+  side.
+- `ExpandedSigningKey::try_sign_mu_deterministic` for fallibly signing a pre-computed `µ`.
+
+### Changed
+- Bind externally computed `µ` values to the verifying key and context string that produced
+  them. `VerifyingKey::compute_mu` now returns a `Mu` value, `VerifyingKey::verify_mu` rejects a
+  `µ` from another key, and `VerifyingKey::verify_mu_with_context` additionally rejects a `µ`
+  reused with a different context.
+- Bind signature decoding to verification with `VerifyingKey::verify_encoded_with_context` and
+  `VerifyingKey::verify_bytes_with_context`.
+
 ## 0.1.2 (2026-10-31)
 ### Added
 - `c_tilde` getter on `Signature` ([#1362])

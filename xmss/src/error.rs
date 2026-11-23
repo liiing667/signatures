@@ -13,6 +13,18 @@ pub enum Error {
     /// All one-time signatures have been used.
     #[error("Key exhausted: all one-time signatures have been used")]
     KeyExhausted,
+    /// The presented key state is older than the state already committed for
+    /// the same key.
+    #[error("Key state rollback: index {index} is behind committed index {committed}")]
+    KeyStateRollback {
+        /// Leaf index encoded in the presented key.
+        index: u64,
+        /// Next-leaf index already committed for this key.
+        committed: u64,
+    },
+    /// A private key and its accompanying public key describe different keys.
+    #[error("Signing key and public key do not match")]
+    KeyMismatch,
     /// The provided seed has an incorrect length.
     #[error("Invalid seed length: expected {expected}, got {got}")]
     InvalidSeedLength {

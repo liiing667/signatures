@@ -14,6 +14,47 @@ mod xmss;
 mod xmss_commons;
 mod xmss_core;
 
+/// Process-local monotonic state tracking for stateful XMSS keys.
+///
+/// XMSS leaf indices are carried inside the secret key, so an unmodified key
+/// file can always be replayed unless the process remembers how far a key has
+/// already advanced. The ledger is keyed by the public part of the key
+/// (parameter set, root, and public seed) and lives for the duration of the
+/// thread, which lets importers reject stale copies while keeping independent
+/// tests and callers isolated from each other.
+mod state {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    std::thread_local! {
+        static COMMITTED_INDEX: RefCell<HashMap<Vec<u8>, u64>> =
+            RefCell::new(HashMap::new());
+    }
+
+    /// Returns the next-leaf index committed for `identity`, if any.
+    pub(crate) fn committed_index(identity: &[u8]) -> Option<u64> {
+        COMMITTED_INDEX.with(|entries| entries.borrow().get(identity).copied())
+    }
+
+    /// Advances the committed next-leaf index for `identity` to at least
+    /// `index`.
+    pub(crate) fn advance(identity: &[u8], index: u64) {
+        COMMITTED_INDEX.with(|entries| {
+            let mut entries = entries.borrow_mut();
+            match entries.get_mut(identity) {
+                Some(committed) => {
+                    if index > *committed {
+                        *committed = index;
+                    }
+                }
+                None => {
+                    entries.insert(identity.to_vec(), index);
+                }
+            }
+        });
+    }
+}
+
 pub use error::{Error, XmssResult};
 
 pub use params::{
@@ -99,7 +140,9 @@ pub use params::{
     XmssShake256_20_256,
 };
 
-pub use xmss::{DetachedSignature, KeyPair, Signature, SigningKey, VerifyingKey};
+pub use xmss::{
+    DetachedSignature, KeyPair, Signature, SigningKey, SigningState, VerifyingKey,
+};
 
 #[cfg(test)]
 mod tests {
@@ -174,6 +217,116 @@ mod tests {
                 .verify_detached(&sig, b"wrong message")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_detached_signing_retry_advances_leaf() {
+        let seed: Vec<u8> = (0u8..96)
+            .map(|b| b.wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let mut kp = KeyPair::<XmssSha2_10_256>::from_seed(&seed).unwrap();
+
+        assert_eq!(kp.signing_key().index(), 0);
+
+        let first = kp.signing_key().sign_detached(b"first").unwrap();
+        assert_eq!(first.index(), 0);
+        assert_eq!(kp.signing_key().leaf_index(), 1);
+        kp.verifying_key().verify_detached(&first, b"first").unwrap();
+
+        // A rejected detached signature must not make its leaf available to
+        // the next attempt.
+        assert!(
+            kp.verifying_key()
+                .verify_detached(&first, b"not the first message")
+                .is_err()
+        );
+        let truncated = &first.as_ref()[..first.as_ref().len() - 1];
+        assert!(DetachedSignature::<XmssSha2_10_256>::try_from(truncated).is_err());
+
+        let second = kp.signing_key().sign_detached(b"second").unwrap();
+        assert_eq!(second.index(), 1);
+        assert_eq!(kp.signing_key().index(), 2);
+        kp.verifying_key()
+            .verify_detached(&second, b"second")
+            .unwrap();
+        assert!(kp
+            .verifying_key()
+            .verify_detached(&first, b"first")
+            .is_ok());
+    }
+
+    #[test]
+    fn test_export_import_preserves_leaf_and_rejects_rollback() {
+        let seed: Vec<u8> = (0u8..96)
+            .map(|b| b.wrapping_mul(53).wrapping_add(7))
+            .collect();
+        let mut kp = KeyPair::<XmssSha2_10_256>::from_seed(&seed).unwrap();
+        let mut copy = kp.signing_key().clone();
+
+        let _ = kp.signing_key().sign_detached(b"leaf zero").unwrap();
+        assert!(matches!(
+            copy.sign_detached(b"same leaf from a copy"),
+            Err(Error::KeyStateRollback { .. })
+        ));
+        let exported = kp.signing_key().as_ref().to_vec();
+        assert_eq!(u32::from_be_bytes(exported[4..8].try_into().unwrap()), 1);
+
+        let mut restored =
+            SigningKey::<XmssSha2_10_256>::try_from(exported.clone()).unwrap();
+        assert_eq!(restored.index(), 1);
+        let restored_state = restored.state();
+        assert_eq!(restored_state.index, 1);
+        assert!(restored_state.committed_index >= 1);
+        assert_eq!(
+            restored_state.key_digest,
+            kp.signing_key().key_digest()
+        );
+        let signature = restored.sign_detached(b"restored").unwrap();
+        assert_eq!(signature.index(), 1);
+        kp.verifying_key()
+            .verify_detached(&signature, b"restored")
+            .unwrap();
+        assert_eq!(restored.index(), 2);
+
+        // Replaying the old key file (or re-deriving the same seed) would
+        // otherwise make the already-used leaf visible again.
+        let mut stale = exported;
+        stale[4..8].fill(0);
+        assert!(matches!(
+            SigningKey::<XmssSha2_10_256>::try_from(stale),
+            Err(Error::KeyStateRollback { .. })
+        ));
+        // Re-deriving the same seed is allowed for public-key inspection, but
+        // the isolated signing key cannot enter the already-used leaf.
+        let mut recovered = KeyPair::<XmssSha2_10_256>::from_seed(&seed).unwrap();
+        let recovered_state = recovered.signing_key().state();
+        assert!(recovered_state.committed_index > recovered_state.index);
+        assert!(matches!(
+            recovered.signing_key().sign_detached(b"rollback"),
+            Err(Error::KeyStateRollback { .. })
+        ));
+    }
+
+    #[test]
+    fn test_exhausted_signing_does_not_rewind_index() {
+        let seed: Vec<u8> = (0u8..96)
+            .map(|b| b.wrapping_mul(71).wrapping_add(3))
+            .collect();
+        let kp = KeyPair::<XmssSha2_10_256>::from_seed(&seed).unwrap();
+        let mut last_bytes = kp.signing_key_ref().as_ref().to_vec();
+        last_bytes[4..8].copy_from_slice(&1023u32.to_be_bytes());
+
+        let mut last = SigningKey::<XmssSha2_10_256>::try_from(last_bytes).unwrap();
+        let signature = last.sign_detached(b"last leaf").unwrap();
+        assert_eq!(signature.index(), 1023);
+        kp.verifying_key()
+            .verify_detached(&signature, b"last leaf")
+            .unwrap();
+
+        let committed = last.index();
+        assert!(committed > 1023);
+        assert!(matches!(last.sign_detached(b"one more"), Err(Error::KeyExhausted)));
+        assert_eq!(last.index(), committed);
     }
 
     #[test]

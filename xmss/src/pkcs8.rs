@@ -93,13 +93,16 @@ impl<P: XmssParameter> KeyPair<P> {
         }
 
         let signing_key = SigningKey::<P>::try_from(pk_info.private_key.as_ref())?;
+        let expected_verifying_key = VerifyingKey::from(&signing_key);
         let verifying_key = if let Some(pk) = pk_info.public_key {
             let pk_bytes = pk.as_bytes().ok_or(pkcs8::KeyError::Invalid)?;
-
-            // TODO(tarcieri): verify key matches expected value?
-            VerifyingKey::<P>::try_from(pk_bytes)?
+            let verifying_key = VerifyingKey::<P>::try_from(pk_bytes)?;
+            if verifying_key != expected_verifying_key {
+                return Err(Error::KeyMismatch);
+            }
+            verifying_key
         } else {
-            VerifyingKey::from(&signing_key)
+            expected_verifying_key
         };
 
         Ok(KeyPair::new(signing_key, verifying_key))

@@ -163,11 +163,7 @@ pub fn xmssmt_core_sign(params: &XmssParams, sk: &mut [u8], m: &[u8]) -> XmssRes
     let idx = bytes_to_ull(&sk[..idx_bytes]);
 
     // Check if key is exhausted before doing anything.
-    let max_idx = if params.full_height >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << params.full_height) - 1
-    };
+    let max_idx = params.max_index();
     if idx > max_idx {
         return Err(Error::KeyExhausted);
     }
@@ -188,14 +184,21 @@ pub fn xmssmt_core_sign(params: &XmssParams, sk: &mut [u8], m: &[u8]) -> XmssRes
     // Write index into signature.
     sm[..idx_bytes].copy_from_slice(&sk[..idx_bytes]);
 
-    // Advance the index in sk.
+    // Reserve the leaf before any signature work that can fail.  The index in
+    // `sk` is the single source of truth for both the returned signature and
+    // any subsequent retry: a failed attempt must never make the same leaf
+    // available again.
+    let next_idx = idx.saturating_add(1);
+    ull_to_bytes(&mut sk[..idx_bytes], next_idx);
+
+    // If this was the last valid leaf, burn the one-time secret material so
+    // that an exhausted key cannot accidentally be used after an error.  The
+    // root and public seed are intentionally retained: they are public values
+    // and keeping them makes the exhausted key retain the same identity.
     if idx == max_idx {
-        // Last valid index — mark as exhausted for next call.
-        for b in sk[..idx_bytes].iter_mut() {
-            *b = 0xFF;
+        for b in sk[sk_seed_start..sk_prf_start + n].iter_mut() {
+            *b = 0;
         }
-    } else {
-        ull_to_bytes(&mut sk[..idx_bytes], idx + 1);
     }
 
     // Compute R (randomness for message hashing).
@@ -260,15 +263,6 @@ pub fn xmssmt_core_sign(params: &XmssParams, sk: &mut [u8], m: &[u8]) -> XmssRes
     // Zeroize secret copies.
     sk_seed.zeroize();
     sk_prf.zeroize();
-
-    // If this was the last valid index, zero the secret key material in sk.
-    if idx == max_idx {
-        #[allow(clippy::cast_possible_truncation)]
-        let sk_bytes_len = params.sk_bytes as usize;
-        for b in sk[idx_bytes..sk_bytes_len].iter_mut() {
-            *b = 0;
-        }
-    }
 
     Ok(sm)
 }

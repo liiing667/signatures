@@ -1,10 +1,13 @@
 use core::marker::PhantomData;
 
 use hybrid_array::Array;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 use crate::error::{Error, XmssResult};
 use crate::params::{XMSS_OID_LEN, XmssOid, XmssParameter, XmssParams};
+use crate::state;
+use crate::utils::bytes_to_ull;
 use crate::xmss_commons;
 use crate::xmss_core;
 
@@ -24,9 +27,45 @@ fn parse_oid_and_params(bytes: &[u8]) -> XmssResult<(XmssOid, XmssParams)> {
     Ok((oid, params))
 }
 
+/// Builds an identity for the public part of a signing key.
+///
+/// The identity deliberately excludes the leaf index and secret seeds: all
+/// copies of the same key share it, so a stale copy can be compared against the
+/// state already observed for the live key.
+fn key_identity(params: &XmssParams, sk_without_oid: &[u8]) -> Vec<u8> {
+    let n = params.n as usize;
+    let idx_bytes = params.index_bytes as usize;
+    let root_start = idx_bytes + 2 * n;
+
+    let mut identity = Vec::with_capacity(16 + 2 * n);
+    identity.extend_from_slice(&params.func.to_be_bytes());
+    identity.extend_from_slice(&params.n.to_be_bytes());
+    identity.extend_from_slice(&params.full_height.to_be_bytes());
+    identity.extend_from_slice(&params.d.to_be_bytes());
+    // [idx || SK_SEED || SK_PRF || root || PUB_SEED]
+    identity.extend_from_slice(&sk_without_oid[root_start..root_start + 2 * n]);
+    identity
+}
+
 // ---------------------------------------------------------------------------
 // SigningKey<P>
 // ---------------------------------------------------------------------------
+
+/// A point-in-time snapshot of a signing key's state.
+///
+/// The snapshot can be logged by callers that need evidence of which leaf was
+/// reserved and which public key the reservation belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SigningState {
+    /// Next leaf index encoded in the signing key.
+    pub index: u64,
+    /// Next-leaf index already committed for this key.
+    pub committed_index: u64,
+    /// Whether the key has no leaves left for signing.
+    pub exhausted: bool,
+    /// Digest of the public identity (parameter set, root, and public seed).
+    pub key_digest: [u8; 32],
+}
 
 /// An XMSS signing key (secret key).
 #[derive(Clone)]
@@ -82,6 +121,18 @@ impl<P: XmssParameter> TryFrom<&[u8]> for SigningKey<P> {
             expected: P::SK_LEN,
             got: value.len(),
         })?;
+        let sk_without_oid = &bytes[XMSS_OID_LEN..];
+        let index_bytes = params.index_bytes as usize;
+        let index = bytes_to_ull(&sk_without_oid[..index_bytes]);
+        let identity = key_identity(&params, sk_without_oid);
+        // A key file is only as fresh as the last index this process has seen
+        // for the same public identity.
+        if let Some(committed) = state::committed_index(&identity) {
+            if index < committed {
+                return Err(Error::KeyStateRollback { index, committed });
+            }
+        }
+        state::advance(&identity, index);
         Ok(Self {
             bytes,
             params,
@@ -161,20 +212,102 @@ impl<P: XmssParameter> SigningKey<P> {
         }
     }
 
+    /// Returns the next leaf index encoded in this signing key.
+    pub fn index(&self) -> u64 {
+        let index_bytes = self.params.index_bytes as usize;
+        bytes_to_ull(&self.bytes[XMSS_OID_LEN..XMSS_OID_LEN + index_bytes])
+    }
+
+    /// Returns the next leaf index encoded in this signing key.
+    ///
+    /// This is an alias for [`Self::index`].
+    pub fn leaf_index(&self) -> u64 {
+        self.index()
+    }
+
+    /// Returns the number of one-time signatures still available.
+    pub fn remaining_signatures(&self) -> u64 {
+        let index = self.index();
+        let max_index = self.params.max_index();
+        if index > max_index {
+            0
+        } else {
+            max_index.saturating_sub(index).saturating_add(1)
+        }
+    }
+
+    /// Returns `true` once the key has no leaves left for signing.
+    pub fn is_exhausted(&self) -> bool {
+        self.index() > self.params.max_index()
+    }
+
+    /// Returns a stable digest of the public identity of this key.
+    ///
+    /// The digest covers the parameter set, Merkle root, and public seed, but
+    /// not the secret seeds or the current leaf index.
+    pub fn key_digest(&self) -> [u8; 32] {
+        let digest = Sha256::digest(self.identity());
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest[..]);
+        out
+    }
+
+    /// Returns a snapshot of the current signing state.
+    pub fn state(&self) -> SigningState {
+        let index = self.index();
+        let identity = self.identity();
+        SigningState {
+            index,
+            committed_index: state::committed_index(&identity).unwrap_or(index),
+            exhausted: index > self.params.max_index(),
+            key_digest: self.key_digest(),
+        }
+    }
+
+    fn identity(&self) -> Vec<u8> {
+        key_identity(&self.params, &self.bytes[XMSS_OID_LEN..])
+    }
+
+    fn check_state(&self) -> XmssResult<()> {
+        let identity = self.identity();
+        let index = self.index();
+        if let Some(committed) = state::committed_index(&identity) {
+            if index < committed {
+                return Err(Error::KeyStateRollback { index, committed });
+            }
+        }
+        Ok(())
+    }
+
+    fn commit_state(&self) {
+        state::advance(&self.identity(), self.index());
+    }
+
+    fn sign_bytes(&mut self, m: &[u8]) -> XmssResult<Vec<u8>> {
+        // Freeze the current leaf index before entering the core signer.  The
+        // core advances the encoded index before it performs any fallible
+        // cryptographic work, so a failed attempt consumes the leaf rather than
+        // making it available to a retry.
+        self.check_state()?;
+        let result =
+            xmss_core::xmssmt_core_sign(&self.params, &mut self.bytes[XMSS_OID_LEN..], m);
+        self.commit_state();
+        result
+    }
+
     /// Signs a message. Returns the signature followed by the message and updates
     /// the internal state (one-time key index is advanced).
     pub fn sign(&mut self, m: &[u8]) -> XmssResult<Signature<P>> {
-        xmss_core::xmssmt_core_sign(&self.params, &mut self.bytes[XMSS_OID_LEN..], m).map(|bytes| {
-            Signature {
-                bytes,
-                _marker: PhantomData,
-            }
+        let bytes = self.sign_bytes(m)?;
+        Ok(Signature {
+            bytes,
+            _marker: PhantomData,
         })
     }
 
     /// Signs a message, returning only the detached signature (without the message appended).
     pub fn sign_detached(&mut self, m: &[u8]) -> XmssResult<DetachedSignature<P>> {
-        let mut sm = xmss_core::xmssmt_core_sign(&self.params, &mut self.bytes[XMSS_OID_LEN..], m)?;
+        let mut sm = self.sign_bytes(m)?;
         let sig_bytes = sm.len() - m.len();
         sm.truncate(sig_bytes);
         Ok(DetachedSignature {
@@ -326,6 +459,9 @@ impl<P: XmssParameter> VerifyingKey<P> {
 
     /// Verifies a detached signature against the provided message.
     pub fn verify_detached(&self, signature: &DetachedSignature<P>, m: &[u8]) -> XmssResult<()> {
+        if signature.index() > self.params.max_index() {
+            return Err(Error::VerificationFailed);
+        }
         let mut sm = Vec::with_capacity(signature.bytes.len() + m.len());
         sm.extend_from_slice(&signature.bytes);
         sm.extend_from_slice(m);
@@ -382,6 +518,25 @@ pub struct Signature<P: XmssParameter> {
 impl<P: XmssParameter> AsRef<[u8]> for Signature<P> {
     fn as_ref(&self) -> &[u8] {
         &self.bytes
+    }
+}
+
+impl<P: XmssParameter> Signature<P> {
+    /// Returns the leaf index encoded in this signature.
+    pub fn index(&self) -> u64 {
+        let params = P::xmss_params();
+        let index_bytes = params.index_bytes as usize;
+        if self.bytes.len() < index_bytes {
+            return u64::MAX;
+        }
+        bytes_to_ull(&self.bytes[..index_bytes])
+    }
+
+    /// Returns the leaf index encoded in this signature.
+    ///
+    /// This is an alias for [`Self::index`].
+    pub fn leaf_index(&self) -> u64 {
+        self.index()
     }
 }
 
@@ -468,6 +623,22 @@ pub struct DetachedSignature<P: XmssParameter> {
 impl<P: XmssParameter> AsRef<[u8]> for DetachedSignature<P> {
     fn as_ref(&self) -> &[u8] {
         &self.bytes
+    }
+}
+
+impl<P: XmssParameter> DetachedSignature<P> {
+    /// Returns the leaf index encoded in this detached signature.
+    pub fn index(&self) -> u64 {
+        let params = P::xmss_params();
+        let index_bytes = params.index_bytes as usize;
+        bytes_to_ull(&self.bytes[..index_bytes])
+    }
+
+    /// Returns the leaf index encoded in this detached signature.
+    ///
+    /// This is an alias for [`Self::index`].
+    pub fn leaf_index(&self) -> u64 {
+        self.index()
     }
 }
 
@@ -638,6 +809,9 @@ impl<P: XmssParameter> KeyPair<P> {
                 got: sk.len(),
             }
         })?;
+        // Deterministic derivation remains available for inspecting the public
+        // key.  If this seed was already advanced, signing with the derived key
+        // is rejected by the per-identity state ledger.
         Ok(Self {
             verifying_key: VerifyingKey::new(pk_array, params),
             signing_key: SigningKey::new(sk_array, params),

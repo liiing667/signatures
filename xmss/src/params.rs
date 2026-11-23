@@ -921,6 +921,15 @@ impl XmssParams {
     pub(crate) fn get_seed_length(&self) -> usize {
         self.n as usize * 3
     }
+
+    /// Returns the last leaf index that may be used for signing.
+    pub(crate) fn max_index(&self) -> u64 {
+        if self.full_height >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << self.full_height) - 1
+        }
+    }
 }
 
 /// All supported XMSS and XMSSMT parameter set OIDs.

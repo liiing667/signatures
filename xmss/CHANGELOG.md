@@ -5,5 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+- Keep the leaf index and committed signing state consistent across detached
+  signing, retries, exports/imports, and verification consumers.  Stale key
+  states are rejected instead of reusing an already-consumed leaf.
+
 ## 0.1.0 (2026-02-20)
 - Initial release

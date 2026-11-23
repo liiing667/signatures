@@ -85,12 +85,14 @@ impl<P: ForsParams> TryFrom<&[u8]> for ForsSignature<P> {
         if slice.len() != Self::SIZE {
             return Err(());
         }
-        Ok(Self(
-            slice
-                .chunks(ForsMTSig::<P>::SIZE)
-                .map(|c| c.try_into().unwrap())
-                .collect(),
-        ))
+        let mut signatures = Array::default();
+        for (signature, bytes) in signatures
+            .iter_mut()
+            .zip(slice.chunks_exact(ForsMTSig::<P>::SIZE))
+        {
+            *signature = ForsMTSig::try_from(bytes)?;
+        }
+        Ok(Self(signatures))
     }
 }
 

@@ -1,5 +1,37 @@
 use crate::fors::ForsParams;
+use ::signature::Error;
 use hybrid_array::{Array, ArraySize, typenum::Unsigned};
+
+/// Validates a FIPS 205 context string and returns the length byte for its `M'` header.
+///
+/// Keeping validation in one place ensures signing and verification reject the same context
+/// lengths before using any signing or verification state.
+pub(crate) fn context_length_prefix(context: &[u8]) -> Result<u8, Error> {
+    u8::try_from(context.len()).map_err(|_| Error::new())
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::context_length_prefix;
+
+    #[test]
+    fn context_length_prefix_uses_fips_length_byte() {
+        assert_eq!(context_length_prefix(b"ctx").unwrap(), 3);
+        assert_eq!(context_length_prefix(&[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn context_length_prefix_accepts_maximum_context() {
+        let context = [7u8; usize::from(u8::MAX)];
+        assert_eq!(context_length_prefix(&context).unwrap(), u8::MAX);
+    }
+
+    #[test]
+    fn context_length_prefix_rejects_oversized_context() {
+        let context = [0u8; usize::from(u8::MAX) + 1];
+        assert!(context_length_prefix(&context).is_err());
+    }
+}
 
 // Algorithm 3
 pub(crate) fn base_2b<OutLen: ArraySize, B: Unsigned>(x: &[u8]) -> Array<u16, OutLen> {

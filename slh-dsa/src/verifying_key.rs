@@ -4,7 +4,7 @@ use crate::Sha2L35;
 use crate::Shake;
 use crate::address::ForsTree;
 use crate::signature_encoding::Signature;
-use crate::util::split_digest;
+use crate::util::{context_length_prefix, split_digest};
 use ::signature::{Error, MultipartVerifier, Verifier};
 use hybrid_array::{Array, ArraySize};
 use pkcs8::{der, spki};
@@ -82,6 +82,8 @@ impl<P: ParameterSet + VerifyingKeyLen> VerifyingKey<P> {
         let fors_sig = &signature.fors_sig;
         let ht_sig = &signature.ht_sig;
 
+        // Both components of the verifying key are included in the message digest, so a
+        // signature cannot be replayed under another key even if its parsed fields are valid.
         let digest = P::h_msg(randomizer, pk_seed, &self.pk_root, msg);
         let (md, idx_tree, idx_leaf) = split_digest::<P>(&digest);
 
@@ -111,11 +113,10 @@ impl<P: ParameterSet + VerifyingKeyLen> VerifyingKey<P> {
         ctx: &[u8],
         signature: &Signature<P>,
     ) -> Result<(), Error> {
-        let ctx_len = u8::try_from(ctx.len()).map_err(|_| Error::new())?;
-        let ctx_len_bytes = ctx_len.to_be_bytes();
-
-        let ctx_msg = [&[&[0], &ctx_len_bytes, ctx], msg];
-        self.raw_slh_verify_internal(&ctx_msg, signature) // TODO - context processing
+        let context_length = context_length_prefix(ctx)?;
+        let context_length = context_length.to_be_bytes();
+        let message_family = [&[&[0], &context_length, ctx], msg];
+        self.raw_slh_verify_internal(&message_family, signature)
     }
 
     /// Serialize the verifying key to a new stack-allocated array
@@ -189,7 +190,7 @@ impl<P: ParameterSet> Verifier<Signature<P>> for VerifyingKey<P> {
 
 impl<P: ParameterSet> MultipartVerifier<Signature<P>> for VerifyingKey<P> {
     fn multipart_verify(&self, msg: &[&[u8]], signature: &Signature<P>) -> Result<(), Error> {
-        self.raw_try_verify_with_context(msg, &[], signature) // TODO - context processing
+        self.raw_try_verify_with_context(msg, &[], signature)
     }
 }
 
@@ -262,5 +263,31 @@ mod tests {
         let vk_bytes: Array<u8, _> = (&vk).into();
         let vk2 = VerifyingKey::<Shake128f>::try_from(vk_bytes.as_slice()).unwrap();
         assert_eq!(vk, vk2);
+    }
+
+    #[test]
+    fn test_vk_rejects_truncated_and_extended_encoding() {
+        let mut rng = rand::rng();
+        let sk = SigningKey::<Shake128f>::new(&mut rng);
+        let vk_bytes = sk.verifying_key().to_bytes();
+
+        assert!(VerifyingKey::<Shake128f>::try_from(&vk_bytes[..vk_bytes.len() - 1]).is_err());
+
+        let mut extended = [0u8; 33];
+        extended[..vk_bytes.len()].copy_from_slice(&vk_bytes);
+        assert!(VerifyingKey::<Shake128f>::try_from(extended.as_slice()).is_err());
+    }
+
+    #[test]
+    fn test_oversized_context_rejected_before_verification() {
+        let mut rng = rand::rng();
+        let sk = SigningKey::<Shake128f>::new(&mut rng);
+        let signature = sk.try_sign(b"message").unwrap();
+        let context = [0u8; usize::from(u8::MAX) + 1];
+
+        assert!(sk
+            .verifying_key()
+            .try_verify_with_context(b"message", &context, &signature)
+            .is_err());
     }
 }

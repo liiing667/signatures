@@ -1,6 +1,6 @@
 use crate::address::{ForsTree, WotsHash};
 use crate::signature_encoding::Signature;
-use crate::util::split_digest;
+use crate::util::{context_length_prefix, split_digest};
 use crate::verifying_key::VerifyingKey;
 use crate::{ParameterSet, PkSeed, Sha2L1, Sha2L35, Shake, VerifyingKeyLen};
 use ::signature::{
@@ -159,6 +159,7 @@ impl<P: ParameterSet> SigningKey<P> {
 
         let randomizer = P::prf_msg(&self.sk_prf, rand, msg);
 
+        // Match verification by binding both public-key components to the message digest.
         let digest = P::h_msg(&randomizer, pk_seed, &self.verifying_key.pk_root, msg);
         let (md, idx_tree, idx_leaf) = split_digest::<P>(&digest);
         let adrs = ForsTree::new(idx_tree, idx_leaf);
@@ -193,11 +194,10 @@ impl<P: ParameterSet> SigningKey<P> {
         ctx: &[u8],
         opt_rand: Option<&[u8]>,
     ) -> Result<Signature<P>, Error> {
-        let ctx_len = u8::try_from(ctx.len()).map_err(|_| Error::new())?;
-        let ctx_len_bytes = ctx_len.to_be_bytes();
-
-        let ctx_msg = [&[&[0], &ctx_len_bytes, ctx], msg];
-        Ok(self.raw_slh_sign_internal(&ctx_msg, opt_rand))
+        let context_length = context_length_prefix(ctx)?;
+        let context_length = context_length.to_be_bytes();
+        let message_family = [&[&[0], &context_length, ctx], msg];
+        Ok(self.raw_slh_sign_internal(&message_family, opt_rand))
     }
 
     /// Serialize the signing key to a new stack-allocated array
@@ -379,5 +379,16 @@ mod tests {
         let bytes = sk.to_bytes();
         let incorrect_bytes = &bytes[..bytes.len() - 1];
         assert!(SigningKey::<Shake128f>::try_from(incorrect_bytes).is_err());
+    }
+
+    #[test]
+    fn test_context_rejected_before_signature_is_generated() {
+        let mut rng = rand::rng();
+        let sk = SigningKey::<Shake128f>::new(&mut rng);
+        let context = [0u8; usize::from(u8::MAX) + 1];
+
+        assert!(sk
+            .try_sign_with_context(b"message", &context, None)
+            .is_err());
     }
 }

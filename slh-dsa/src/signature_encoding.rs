@@ -46,6 +46,15 @@ impl<P: ParameterSet> PartialEq for Signature<P> {
 impl<P: ParameterSet> Eq for Signature<P> {}
 
 impl<P: ParameterSet> Signature<P> {
+    /// Serialized length of the signature randomizer.
+    const RANDOMIZER_SIZE: usize = P::N::USIZE;
+
+    /// Serialized length of the FORS portion of the signature.
+    const FORS_SIGNATURE_SIZE: usize = ForsSignature::<P>::SIZE;
+
+    /// Serialized length of the hypertree portion of the signature.
+    const HYPERTREE_SIGNATURE_SIZE: usize = HypertreeSig::<P>::SIZE;
+
     #[cfg(feature = "alloc")]
     /// Serialize the signature to a `Vec<u8>` of length `P::SigLen`.
     pub fn to_vec(&self) -> alloc::vec::Vec<u8> {
@@ -53,7 +62,7 @@ impl<P: ParameterSet> Signature<P> {
         bytes.extend_from_slice(&self.randomizer);
         bytes.extend_from_slice(&self.fors_sig.to_vec());
         bytes.extend_from_slice(&self.ht_sig.to_vec());
-        debug_assert!(bytes.len() == P::SigLen::USIZE);
+        debug_assert_eq!(bytes.len(), P::SigLen::USIZE);
         bytes
     }
 
@@ -61,12 +70,18 @@ impl<P: ParameterSet> Signature<P> {
     /// This clones the underlying fields
     pub fn to_bytes(&self) -> Array<u8, P::SigLen> {
         let mut bytes = Array::<u8, P::SigLen>::default();
-        let r_size = P::N::USIZE;
-        let fors_size = ForsSignature::<P>::SIZE;
-        bytes[..r_size].copy_from_slice(&self.randomizer);
-        self.fors_sig
-            .write_to(&mut bytes[r_size..r_size + fors_size]);
-        self.ht_sig.write_to(&mut bytes[r_size + fors_size..]);
+        debug_assert_eq!(
+            P::SigLen::USIZE,
+            Self::RANDOMIZER_SIZE + Self::FORS_SIGNATURE_SIZE + Self::HYPERTREE_SIGNATURE_SIZE
+        );
+        bytes[..Self::RANDOMIZER_SIZE].copy_from_slice(&self.randomizer);
+        self.fors_sig.write_to(
+            &mut bytes[Self::RANDOMIZER_SIZE
+                ..Self::RANDOMIZER_SIZE + Self::FORS_SIGNATURE_SIZE],
+        );
+        self.ht_sig.write_to(
+            &mut bytes[Self::RANDOMIZER_SIZE + Self::FORS_SIGNATURE_SIZE..],
+        );
         bytes
     }
 }
@@ -82,14 +97,19 @@ impl<P: ParameterSet> TryFrom<&[u8]> for Signature<P> {
 
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
         if bytes.len() != P::SigLen::USIZE {
-            return Err(Error::new()); // TODO: Real error
+            return Err(Error::new());
         }
 
-        let (rand_bytes, rest) = bytes.split_at(P::N::USIZE);
+        debug_assert_eq!(
+            bytes.len(),
+            Self::RANDOMIZER_SIZE + Self::FORS_SIGNATURE_SIZE + Self::HYPERTREE_SIGNATURE_SIZE
+        );
+
+        let (rand_bytes, rest) = bytes.split_at(Self::RANDOMIZER_SIZE);
         #[allow(deprecated)]
         let randomizer = Array::clone_from_slice(rand_bytes);
 
-        let (fors_bytes, ht_bytes) = rest.split_at(ForsSignature::<P>::SIZE);
+        let (fors_bytes, ht_bytes) = rest.split_at(Self::FORS_SIGNATURE_SIZE);
         let fors_sig = ForsSignature::try_from(fors_bytes).map_err(|()| Error::new())?;
         let ht_sig = HypertreeSig::try_from(ht_bytes).map_err(|()| Error::new())?;
 
@@ -256,5 +276,18 @@ mod tests {
             Signature::<Shake128f>::try_from(incorrect_sig_bytes).is_err(),
             "Deserialization should fail on incorrect length"
         );
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn test_deserialize_rejects_extra_tail() {
+        let mut rng = rand::rng();
+        let sk = SigningKey::<Shake128f>::new(&mut rng);
+        let msg = b"Hello, world!";
+        let sig = sk.try_sign(msg).unwrap();
+        let mut sig_bytes: alloc::vec::Vec<u8> = sig.to_bytes().as_slice().to_vec();
+        sig_bytes.push(0);
+
+        assert!(Signature::<Shake128f>::try_from(sig_bytes.as_slice()).is_err());
     }
 }

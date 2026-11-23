@@ -126,6 +126,21 @@ mod tests {
     }
 
     #[test]
+    fn test_context_signature_rejects_wrong_verifying_key() {
+        let mut rng = rand::rng();
+        let sk = SigningKey::<Shake128f>::new(&mut rng);
+        let wrong_sk = SigningKey::<Shake128f>::new(&mut rng);
+        let msg = b"Hello, world!";
+        let ctx = b"key identity context";
+        let sig = sk.try_sign_with_context(msg, ctx, None).unwrap();
+
+        assert!(wrong_sk
+            .verifying_key()
+            .try_verify_with_context(msg, ctx, &sig)
+            .is_err());
+    }
+
+    #[test]
     fn test_sign_verify_fail_on_modified_signature() {
         let mut rng = rand::rng();
         let sk = SigningKey::<Shake128f>::new(&mut rng);
@@ -181,5 +196,81 @@ mod tests {
         let wrong_ctx = b"Wrong context";
         let sig = sk.try_sign_with_context(msg, ctx, None).unwrap();
         assert!(vk.try_verify_with_context(msg, wrong_ctx, &sig).is_err());
+    }
+
+    #[test]
+    fn test_empty_context_is_same_message_family_as_default_signer() {
+        let sk = SigningKey::<Shake128f>::new(&mut rand::rng());
+        let vk = sk.verifying_key();
+        let msg = b"Hello, world!";
+
+        let default_sig = sk.try_sign(msg).unwrap();
+        let explicit_empty_ctx_sig = sk.try_sign_with_context(msg, &[], None).unwrap();
+
+        vk.try_verify_with_context(msg, &[], &default_sig).unwrap();
+        vk.verify(msg, &explicit_empty_ctx_sig).unwrap();
+    }
+
+    #[test]
+    fn test_cross_context_signature_and_retry_stay_bound_to_message_family() {
+        let mut rng = rand::rng();
+        let sk = SigningKey::<Shake128f>::new(&mut rng);
+        let vk = sk.verifying_key();
+        let msg = b"Hello, world!";
+        let ctx = b"original context";
+        let other_ctx = b"different context";
+
+        let sig = sk.try_sign_with_context(msg, ctx, None).unwrap();
+        vk.try_verify_with_context(msg, ctx, &sig).unwrap();
+        assert!(vk
+            .try_verify_with_context(msg, other_ctx, &sig)
+            .is_err());
+
+        // A failed cross-context verification must not leave the original signature or its
+        // encoding associated with the second context.
+        let retry_sig = sk.try_sign_with_context(msg, ctx, None).unwrap();
+        assert_eq!(sig, retry_sig);
+        vk.try_verify_with_context(msg, ctx, &retry_sig).unwrap();
+        assert!(vk
+            .try_verify_with_context(msg, other_ctx, &retry_sig)
+            .is_err());
+    }
+
+    #[test]
+    fn test_truncated_signature_is_rejected_before_verification_and_encoding() {
+        let mut rng = rand::rng();
+        let sk = SigningKey::<Shake128f>::new(&mut rng);
+        let vk = sk.verifying_key();
+        let msg = b"Hello, world!";
+        let ctx = b"truncation context";
+        let sig = sk.try_sign_with_context(msg, ctx, None).unwrap();
+        let mut sig_bytes = sig.to_bytes();
+
+        sig_bytes[sig_bytes.len() - 1] ^= 0x01;
+        let modified_sig = Signature::<Shake128f>::try_from(sig_bytes.as_slice()).unwrap();
+        assert!(vk
+            .try_verify_with_context(msg, ctx, &modified_sig)
+            .is_err());
+
+        let truncated = &sig_bytes[..sig_bytes.len() - 1];
+        assert!(Signature::<Shake128f>::try_from(truncated).is_err());
+
+        let valid_sig = Signature::<Shake128f>::try_from(sig.to_bytes().as_slice()).unwrap();
+        assert_eq!(valid_sig, sig);
+        vk.try_verify_with_context(msg, ctx, &valid_sig).unwrap();
+    }
+
+    #[test]
+    fn test_oversized_context_does_not_consume_signature() {
+        let mut rng = rand::rng();
+        let sk = SigningKey::<Shake128f>::new(&mut rng);
+        let vk = sk.verifying_key();
+        let msg = b"Hello, world!";
+        let ctx = [0u8; 256];
+        let sig = sk.try_sign(msg).unwrap();
+
+        assert!(sk.try_sign_with_context(msg, &ctx, None).is_err());
+        assert!(vk.try_verify_with_context(msg, &ctx, &sig).is_err());
+        vk.verify(msg, &sig).unwrap();
     }
 }

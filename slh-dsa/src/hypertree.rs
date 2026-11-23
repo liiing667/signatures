@@ -49,11 +49,14 @@ impl<P: HypertreeParams> TryFrom<&[u8]> for HypertreeSig<P> {
         if value.len() != Self::SIZE {
             return Err(());
         }
-        let sig = value
-            .chunks(XmssSig::<P>::SIZE)
-            .map(|c| XmssSig::try_from(c).unwrap())
-            .collect();
-        Ok(HypertreeSig(sig))
+        let mut signatures = Array::default();
+        for (signature, bytes) in signatures
+            .iter_mut()
+            .zip(value.chunks_exact(XmssSig::<P>::SIZE))
+        {
+            *signature = XmssSig::try_from(bytes)?;
+        }
+        Ok(HypertreeSig(signatures))
     }
 }
 

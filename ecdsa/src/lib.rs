@@ -308,6 +308,23 @@ where
         result.s.conditional_assign(&s_inv, self.s.is_high());
         result
     }
+
+    /// Normalize signature into "low S" form and keep its [`crate::RecoveryId`] consistent.
+    ///
+    /// Replacing `s` with `-s` selects the other possible y-coordinate for the recovered `R`
+    /// point, so the low bit of the recovery ID must be inverted at the same time.
+    #[must_use]
+    pub fn normalize_s_with_recovery_id(
+        &self,
+        recovery_id: crate::RecoveryId,
+    ) -> (Self, crate::RecoveryId) {
+        let signature = self.normalize_s();
+        let is_high = self.s.is_high();
+        let mut recovery_id = recovery_id;
+        recovery_id.0 ^= is_high.unwrap_u8();
+
+        (signature, recovery_id)
+    }
 }
 
 impl<C> From<Signature<C>> for SignatureBytes<C>

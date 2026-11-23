@@ -476,4 +476,45 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn test_non_canonical_integer_encoding() {
+        // `r` has an unnecessary leading zero. DER INTEGERs must use the shortest possible
+        // encoding while retaining a non-negative sign bit.
+        assert!(
+            Signature::from_der(&[
+                0x30, 0x08, 0x02, 0x03, 0x00, 0x01, 0x01, 0x02, 0x01, 0x01,
+            ])
+            .is_err()
+        );
+
+        // `s` has an unnecessary leading zero.
+        assert!(
+            Signature::from_der(&[
+                0x30, 0x08, 0x02, 0x01, 0x01, 0x02, 0x03, 0x00, 0x01, 0x01,
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_trailing_bytes_are_rejected() {
+        assert!(
+            Signature::from_der(&[
+                0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x00,
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_scalar_larger_than_curve_field_size() {
+        // MockCurve has 32-byte scalars; a 33-byte DER INTEGER is rejected after parsing.
+        let mut signature = [0u8; 40];
+        signature[..4].copy_from_slice(&[0x30, 0x26, 0x02, 0x21]);
+        signature[4] = 0x01;
+        signature[37..].copy_from_slice(&[0x02, 0x01, 0x01]);
+
+        assert!(Signature::from_der(&signature).is_err());
+    }
 }

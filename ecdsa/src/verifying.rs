@@ -134,6 +134,70 @@ where
     }
 }
 
+#[cfg(feature = "der")]
+impl<C> VerifyingKey<C>
+where
+    C: EcdsaCurve + CurveArithmetic,
+    AffinePoint<C>: FromSec1Point<C> + ToSec1Point<C>,
+    FieldBytesSize<C>: sec1::ModulusSize,
+    der::MaxSize<C>: ArraySize,
+    <FieldBytesSize<C> as Add>::Output: Add<der::MaxOverhead> + ArraySize,
+{
+    /// Recover a [`VerifyingKey`] from a message, canonical DER signature, and
+    /// [`crate::RecoveryId`].
+    ///
+    /// # Errors
+    /// Returns [`Error`] if `signature` is not a valid, canonical DER-encoded ECDSA signature or
+    /// if public key recovery fails.
+    pub fn recover_from_der_msg(
+        msg: &[u8],
+        signature: &der::Signature<C>,
+        recovery_id: crate::RecoveryId,
+    ) -> Result<Self>
+    where
+        C: crate::DigestAlgorithm,
+    {
+        let signature = Signature::<C>::try_from(signature.clone())?;
+        Self::recover_from_msg(msg, &signature, recovery_id)
+    }
+
+    /// Recover a [`VerifyingKey`] from a [`digest::Digest`], canonical DER signature, and
+    /// [`crate::RecoveryId`].
+    ///
+    /// # Errors
+    /// Returns [`Error`] if `signature` is not a valid, canonical DER-encoded ECDSA signature or
+    /// if public key recovery fails.
+    pub fn recover_from_der_digest<D>(
+        msg_digest: D,
+        signature: &der::Signature<C>,
+        recovery_id: crate::RecoveryId,
+    ) -> Result<Self>
+    where
+        D: digest::Digest,
+    {
+        let signature = Signature::<C>::try_from(signature.clone())?;
+        Self::recover_from_digest(msg_digest, &signature, recovery_id)
+    }
+
+    /// Recover a [`VerifyingKey`] from a prehash, canonical DER signature, and
+    /// [`crate::RecoveryId`].
+    ///
+    /// As with fixed-width recovery, callers which have an expected key must compare the returned
+    /// key against it; [`crate::RecoveryId`] selects one of several mathematically possible keys.
+    ///
+    /// # Errors
+    /// Returns [`Error`] if `signature` is not a valid, canonical DER-encoded ECDSA signature or
+    /// if public key recovery fails.
+    pub fn recover_from_der_prehash(
+        prehash: &[u8],
+        signature: &der::Signature<C>,
+        recovery_id: crate::RecoveryId,
+    ) -> Result<Self> {
+        let signature = Signature::<C>::try_from(signature.clone())?;
+        Self::recover_from_prehash(prehash, &signature, recovery_id)
+    }
+}
+
 //
 // `*Verifier` trait impls
 //

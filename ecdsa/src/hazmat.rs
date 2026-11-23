@@ -20,7 +20,6 @@ use elliptic_curve::{
     group::{Curve as _, Group},
     ops::{Invert, MulByGeneratorVartime, Reduce},
     point::AffineCoordinates,
-    scalar::IsHigh,
 };
 
 #[cfg(feature = "digest")]
@@ -83,8 +82,7 @@ where
 
     // Apply low-S normalization if the curve is configured for it
     if C::NORMALIZE_S {
-        recovery_id.0 ^= s.is_high().unwrap_u8();
-        signature = signature.normalize_s();
+        (signature, recovery_id) = signature.normalize_s_with_recovery_id(recovery_id);
     }
 
     Ok((signature, recovery_id))

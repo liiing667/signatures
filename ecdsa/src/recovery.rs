@@ -355,6 +355,11 @@ where
     /// Failure to use such a digest algorithm to compute `prehash` allows an attacker to solve for
     /// it in a system of linear equations that can cause the recovery function to output any public
     /// key the attacker wants.
+    ///
+    /// A [`RecoveryId`] selects one of the possible public keys for the same signature bytes.
+    /// Applications which know or expect a particular public key must compare the recovered key
+    /// against it; use [`RecoveryId::trial_recovery_from_prehash`] when searching for the matching
+    /// recovery ID.
     /// </div>
     ///
     /// # Errors
@@ -430,5 +435,112 @@ mod tests {
         assert!(RecoveryId::try_from(1).expect("RecoveryId").is_y_odd());
         assert!(!RecoveryId::try_from(2).expect("RecoveryId").is_y_odd());
         assert!(RecoveryId::try_from(3).expect("RecoveryId").is_y_odd());
+    }
+}
+
+#[cfg(all(test, feature = "dev"))]
+mod dev_tests {
+    use super::{RecoveryId, Signature, SigningKey, VerifyingKey};
+    use elliptic_curve::{
+        FieldBytes, NonZeroScalar,
+        array::Array,
+        dev::MockCurve,
+        scalar::IsHigh,
+    };
+    use sha2::Sha256;
+
+    fn signing_key() -> SigningKey<MockCurve> {
+        let bytes = FieldBytes::<MockCurve>::from(Array::from([1u8; 32]));
+        let scalar = NonZeroScalar::<MockCurve>::from_repr(bytes)
+            .into_option()
+            .expect("valid signing scalar");
+        scalar.into()
+    }
+
+    fn high_s_signature(
+        signature: &Signature<MockCurve>,
+    ) -> (Signature<MockCurve>, RecoveryId) {
+        let (_, s) = signature.split_scalars();
+        let s = -s;
+        let high_s_signature = Signature::from_scalars(signature.r().to_repr(), s.to_repr())
+            .expect("valid high-S signature");
+
+        assert!(high_s_signature.s().is_high().into());
+        high_s_signature.normalize_s_with_recovery_id(RecoveryId::new(false, false))
+    }
+
+    #[test]
+    fn fixed_width_and_der_recovery_resolve_to_same_key() {
+        let signing_key = signing_key();
+        let prehash = Sha256::digest(b"cross-field recovery");
+        let (signature, recovery_id) = signing_key.sign_prehash_recoverable(&prehash);
+        let der_signature = signature.to_der();
+        let der_fixed_width_signature =
+            Signature::from_der(der_signature.as_bytes()).expect("canonical DER round trip");
+
+        let fixed_width_key =
+            VerifyingKey::recover_from_prehash(&prehash, &signature, recovery_id)
+                .expect("fixed-width recovery");
+        let der_key =
+            VerifyingKey::recover_from_der_prehash(&prehash, &der_signature, recovery_id)
+                .expect("DER recovery");
+
+        assert_eq!(signature, der_fixed_width_signature);
+        assert_eq!(signing_key.verifying_key(), &fixed_width_key);
+        assert_eq!(fixed_width_key, der_key);
+    }
+
+    #[test]
+    fn high_s_normalization_keeps_recovery_identity() {
+        let signing_key = signing_key();
+        let prehash = Sha256::digest(b"high-S recovery");
+        let (signature, recovery_id) = signing_key.sign_prehash_recoverable(&prehash);
+        let (high_s_signature, high_s_recovery_id) = high_s_signature(&signature);
+
+        assert_ne!(signature, high_s_signature);
+        assert_eq!(recovery_id.is_y_odd(), !high_s_recovery_id.is_y_odd());
+        assert_eq!(recovery_id.is_x_reduced(), high_s_recovery_id.is_x_reduced());
+
+        let original_key =
+            VerifyingKey::recover_from_prehash(&prehash, &high_s_signature, high_s_recovery_id)
+                .expect("high-S recovery");
+        let (normalized_signature, normalized_recovery_id) =
+            high_s_signature.normalize_s_with_recovery_id(high_s_recovery_id);
+        let normalized_key =
+            VerifyingKey::recover_from_prehash(
+                &prehash,
+                &normalized_signature,
+                normalized_recovery_id,
+            )
+            .expect("low-S recovery");
+
+        assert_eq!(signature, normalized_signature);
+        assert_eq!(recovery_id, normalized_recovery_id);
+        assert_eq!(signing_key.verifying_key(), &original_key);
+        assert_eq!(original_key, normalized_key);
+    }
+
+    #[test]
+    fn wrong_recovery_id_recovers_a_different_key() {
+        let signing_key = signing_key();
+        let prehash = Sha256::digest(b"wrong recovery ID");
+        let (signature, recovery_id) = signing_key.sign_prehash_recoverable(&prehash);
+        let wrong_recovery_id = RecoveryId::from_byte(recovery_id.to_byte() ^ 1)
+            .expect("valid alternative recovery ID");
+        assert_ne!(recovery_id, wrong_recovery_id);
+
+        let expected_key =
+            VerifyingKey::recover_from_prehash(&prehash, &signature, recovery_id)
+                .expect("correct recovery");
+        let wrong_key =
+            VerifyingKey::recover_from_prehash(&prehash, &signature, wrong_recovery_id)
+                .expect("alternative recovery");
+
+        assert_ne!(expected_key, wrong_key);
+        assert_eq!(
+            RecoveryId::trial_recovery_from_prehash(&expected_key, &prehash, &signature)
+                .expect("trial recovery"),
+            recovery_id
+        );
     }
 }

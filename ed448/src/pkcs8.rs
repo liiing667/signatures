@@ -172,12 +172,23 @@ impl TryFrom<PrivateKeyInfoRef<'_>> for KeypairBytes {
             _ => Err(KeyError::Invalid),
         }?;
 
+        // The public key is optional, but when present it must be well-formed.
+        //
+        // A malformed public key is an error rather than something to be
+        // silently dropped: this ensures the public part, the secret key, and
+        // anything re-encoded from the resulting `KeypairBytes` all describe
+        // one and the same object, and that decoding is the inverse of
+        // encoding for every document we accept.
         let public_key = private_key
             .public_key
-            .and_then(|bs| bs.as_bytes())
-            .map(|bytes| bytes.try_into().map_err(|_| KeyError::Invalid))
-            .transpose()?
-            .map(PublicKeyBytes);
+            .map(|bs| {
+                bs.as_bytes()
+                    .ok_or(KeyError::Invalid)?
+                    .try_into()
+                    .map(PublicKeyBytes)
+                    .map_err(|_| KeyError::Invalid)
+            })
+            .transpose()?;
 
         Ok(Self {
             secret_key,

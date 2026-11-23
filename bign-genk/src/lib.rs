@@ -62,6 +62,20 @@ type BlockArray<C> = <<C as BlockSizeUser>::BlockSize as ArraySize>::ArrayType<u
 ///
 /// - `C`: block cipher used by `belt-wbl` (`belt-block`).
 /// - `U`: [`bigint`] integer type holding the curve order `q`.
+///
+/// # Generation lifecycle
+///
+/// A generator owns a mutable belt-wbl state `r` and evolves it every time a candidate is
+/// produced. All of this evolution happens within a *generation*: a generation starts whenever a
+/// context is accepted ([`KGenerator::new`] for the initial context,
+/// [`KGenerator::accept_context`] for a subsequent one) and covers every candidate produced for
+/// that context, including the retries performed after an unsuitable `k` or a failed signature.
+///
+/// Accepting a new context starts a new generation: the belt-wbl state `r` is reset to the new
+/// message digest and the belt-block key `θ` is re-derived from the new associated data, so no
+/// state from the previous generation leaks into the next one. A retry
+/// ([`KGenerator::fill_next_k`]) never crosses a generation boundary on its own: it keeps
+/// evolving the state of the generation that is currently in progress.
 pub struct KGenerator<'a, C, U>
 where
     C: BlockSizeUser + Clone + BlockCipherEncrypt + KeyInit,
@@ -76,6 +90,9 @@ where
     n: usize,
     /// Field modulus.
     q: &'a U,
+    /// Monotonic generation counter. Incremented every time a context is accepted, i.e. once by
+    /// [`KGenerator::new`] and again by every [`KGenerator::accept_context`] call.
+    generation: u64,
 }
 
 impl<'a, C, U> KGenerator<'a, C, U>
@@ -92,7 +109,65 @@ where
     /// - `h`: hash/digest of an input message: must be reduced modulo `q` in advance
     /// - `data`: additional associated data `t`, e.g. CSRNG output used as added entropy
     /// - `q`: curve order, as a [`bigint`] integer (the candidate `k` is compared against it)
+    ///
+    /// Accepting the initial context starts the first generation of the generator.
+    #[must_use]
     pub fn new<M: AssociatedOid>(x: &[u8], h: &[u8], data: &[u8], q: &'a U) -> Self {
+        let (cipher, r, n) = Self::accept::<M>(x, h, data);
+
+        Self {
+            cipher,
+            r,
+            n,
+            q,
+            generation: 0,
+        }
+    }
+
+    /// Accept a new context and start a new generation.
+    ///
+    /// The generator is re-seeded exactly as if it had been constructed with
+    /// [`KGenerator::new`] using `x`, `h` and `data`: the belt-block key `θ` is re-derived from
+    /// `x` and the associated data `data`, and the belt-wbl state `r` is reset to `h`. Any state
+    /// accumulated while producing candidates for previous contexts (including in-flight retry
+    /// state) is discarded, so subsequent [`KGenerator::fill_next_k`] calls emit candidates of
+    /// the new generation rather than replaying the old ones.
+    ///
+    /// Call this between independent signing attempts, e.g. when the message digest or the added
+    /// entropy changes. Retries of the *same* attempt must keep calling
+    /// [`KGenerator::fill_next_k`] instead, so that they evolve the current generation as
+    /// required by STB 34.101.45.
+    ///
+    /// The parameters have the same meaning and validity requirements as in [`KGenerator::new`].
+    pub fn accept_context<M: AssociatedOid>(&mut self, x: &[u8], h: &[u8], data: &[u8]) {
+        let (cipher, r, n) = Self::accept::<M>(x, h, data);
+
+        self.cipher = cipher;
+        self.r = r;
+        self.n = n;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Index of the generation currently in progress.
+    ///
+    /// Starts at zero for the context accepted by [`KGenerator::new`] and is incremented by
+    /// every [`KGenerator::accept_context`] call. Candidates produced while the same generation
+    /// is active share an evolved belt-wbl state; accepting a new context starts a fresh
+    /// generation with a reset state.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Derive a fresh belt-block key `θ` and the initial belt-wbl state `r` from a context.
+    ///
+    /// Shared by [`KGenerator::new`] and [`KGenerator::accept_context`] so that accepting the
+    /// initial context and accepting a subsequent one perform exactly the same initialization.
+    fn accept<M: AssociatedOid>(
+        x: &[u8],
+        h: &[u8],
+        data: &[u8],
+    ) -> (C, [Array<u8, C::BlockSize>; 4], usize) {
         let len = x.len();
         assert_eq!(len, h.len());
         assert!(len == 32 || len == 48 || len == 64);
@@ -118,13 +193,15 @@ where
             r[i][..chunk.len()].copy_from_slice(chunk);
         }
 
-        Self { cipher, r, n, q }
+        (cipher, r, n)
     }
 
     /// Generate a candidate `k` value.
     ///
     /// This may be called repeatedly in the event a particular `k` is unsuitable, e.g. the
-    /// resulting `r` value is zero.
+    /// resulting `r` value is zero. Every call advances the belt-wbl state of the generation
+    /// that is currently in progress; the generation itself only changes when a new context is
+    /// accepted via [`KGenerator::accept_context`].
     pub fn fill_next_k(&mut self, k: &mut [u8]) {
         let bs = C::BlockSize::USIZE;
         let n = self.n;
@@ -292,4 +369,186 @@ mod tests {
             hex!("07ABBF85 80E7E5A3 21E9B940 F667AE20 9E2952CE F557978A E743DB08 6BAB4885 B708233C 3F5541DF 8AAFC361 1482FDE4 98E58B33 79A6622D AC2664C9 C118A162"),
             hex!("47F9F579 98B359FE 1EF1E693 D5ADF97E 208314C0 ED013235 101E6EDA 7675BABD 125F4D99 93B4A810 9B4A9832 21DF6A42 E7CCA9F4 15A45810 84B1F203 5FD80376");
     }
+
+    /// BIGN P-256 curve order `q` (big-endian), shared by the generation lifecycle tests.
+    const TEST_Q: [u8; 32] =
+        hex!("FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFF C95E2EAB 40309C49 56129C2E F129D6CC");
+
+    /// Two distinct reduced-mod-`q` message digests, used as alternating contexts.
+    const H_A: [u8; 32] =
+        hex!("ABEF9725 D4C5A835 97A367D1 4494CC25 42F20F65 9DDFECC9 61A3EC55 0CBA8C75");
+    const H_B: [u8; 32] =
+        hex!("9D02EE44 6FB6A29F E5C982D4 B13AF9D3 E90861BC 4CEF27CF 306BFB0B 174A154A");
+
+    /// Two distinct pieces of associated data, used as alternating contexts.
+    const DATA_1: [u8; 4] = hex!("DEAD BEEF");
+    const DATA_2: [u8; 4] = hex!("CAFE F00D");
+
+    /// First fixed-vector secret key (`bign_gek_1`).
+    const X: [u8; 32] =
+        hex!("1F66B5B8 4B733967 4533F032 9C74F218 34281FED 0732429E 0C79235F C273E269");
+
+    /// Produce the next candidate `k` from `kgen` as an owned byte array.
+    fn next_k(kgen: &mut KGenerator<'_, BeltBlock, U256>) -> [u8; 32] {
+        let mut k = [0u8; 32];
+        kgen.fill_next_k(&mut k);
+        k
+    }
+
+    #[test]
+    fn first_generation_starts_at_zero_and_retries_stay_in_it() {
+        let q = U256::from_be_slice(&TEST_Q);
+        let mut kgen = KGenerator::<BeltBlock, U256>::new::<BeltHash>(&X, &H_A, &DATA_1, &q);
+
+        assert_eq!(kgen.generation(), 0);
+
+        // A retry after an unsuitable `k` (simulated by simply asking again) must keep evolving
+        // the same generation rather than opening a new one, and every candidate must differ.
+        let k1 = next_k(&mut kgen);
+        let k2 = next_k(&mut kgen);
+        let k3 = next_k(&mut kgen);
+
+        assert_eq!(kgen.generation(), 0);
+        assert_ne!(k1, k2);
+        assert_ne!(k2, k3);
+        assert_ne!(k1, k3);
+    }
+
+    #[test]
+    fn accept_context_starts_a_new_generation_and_resets_state() {
+        let q = U256::from_be_slice(&TEST_Q);
+        let mut kgen = KGenerator::<BeltBlock, U256>::new::<BeltHash>(&X, &H_A, &DATA_1, &q);
+
+        // Drain several candidates so the belt-wbl state has drifted far from its initial value.
+        let stale: [[u8; 32]; 3] = [next_k(&mut kgen), next_k(&mut kgen), next_k(&mut kgen)];
+        assert_eq!(kgen.generation(), 0);
+
+        // Accepting a changed context opens generation 1.
+        kgen.accept_context::<BeltHash>(&X, &H_B, &DATA_2);
+        assert_eq!(kgen.generation(), 1);
+
+        // The first candidate of the new generation must match a freshly constructed generator
+        // for the same context, proving the old belt-wbl state was fully reset.
+        let mut fresh = KGenerator::<BeltBlock, U256>::new::<BeltHash>(&X, &H_B, &DATA_2, &q);
+        assert_eq!(next_k(&mut kgen), next_k(&mut fresh));
+
+        // And it must not replay any candidate emitted by the previous generation.
+        let first = next_k(&mut kgen);
+        assert!(stale.iter().all(|old| *old != first));
+    }
+
+    #[test]
+    fn alternating_contexts_produce_distinct_k_and_deterministic_generations() {
+        let q = U256::from_be_slice(&TEST_Q);
+        let mut kgen = KGenerator::<BeltBlock, U256>::new::<BeltHash>(&X, &H_A, &DATA_1, &q);
+
+        // Reference generators constructed directly for each context.
+        let mut ref_a = KGenerator::<BeltBlock, U256>::new::<BeltHash>(&X, &H_A, &DATA_1, &q);
+        let mut ref_b = KGenerator::<BeltBlock, U256>::new::<BeltHash>(&X, &H_B, &DATA_2, &q);
+
+        // A → B → A → B, interleaved with retries inside each generation.
+        let k_a1 = next_k(&mut kgen);
+        let k_a1_retry = next_k(&mut kgen);
+        kgen.accept_context::<BeltHash>(&X, &H_B, &DATA_2);
+        assert_eq!(kgen.generation(), 1);
+        let k_b1 = next_k(&mut kgen);
+        let k_b1_retry = next_k(&mut kgen);
+
+        kgen.accept_context::<BeltHash>(&X, &H_A, &DATA_1);
+        assert_eq!(kgen.generation(), 2);
+        let k_a2 = next_k(&mut kgen);
+        let k_a2_retry = next_k(&mut kgen);
+
+        kgen.accept_context::<BeltHash>(&X, &H_B, &DATA_2);
+        assert_eq!(kgen.generation(), 3);
+        let k_b2 = next_k(&mut kgen);
+
+        // Every acceptance restarts the generation from the same initial belt-wbl state, so a
+        // re-accepted context replays its own sequence from the beginning...
+        assert_eq!(k_a1, next_k(&mut ref_a));
+        assert_eq!(k_a2, k_a1);
+        assert_eq!(k_a2_retry, k_a1_retry);
+        assert_eq!(k_b1, next_k(&mut ref_b));
+        assert_eq!(k_b2, k_b1);
+
+        // ...while the two contexts never share candidates or in-generation retry sequences.
+        assert_ne!(k_a1, k_b1);
+        assert_ne!(k_a1_retry, k_b1_retry);
+        assert_ne!(k_a1, k_a1_retry);
+        assert_ne!(k_b1, k_b1_retry);
+    }
+
+    #[test]
+    fn changed_associated_data_alone_starts_a_new_generation() {
+        let q = U256::from_be_slice(&TEST_Q);
+        let mut kgen = KGenerator::<BeltBlock, U256>::new::<BeltHash>(&X, &H_A, &DATA_1, &q);
+        let with_data_1 = next_k(&mut kgen);
+
+        // Same key and digest, only the associated data changes: a new generation must still be
+        // derived, i.e. the generator must not keep emitting candidates for the old `data`.
+        kgen.accept_context::<BeltHash>(&X, &H_A, &DATA_2);
+        assert_eq!(kgen.generation(), 1);
+        let with_data_2 = next_k(&mut kgen);
+        assert_ne!(with_data_1, with_data_2);
+
+        // A directly constructed generator with the new associated data agrees.
+        let mut fresh = KGenerator::<BeltBlock, U256>::new::<BeltHash>(&X, &H_A, &DATA_2, &q);
+        assert_eq!(with_data_2, next_k(&mut fresh));
+    }
+
+    #[test]
+    fn empty_context_round_trip_restores_the_original_generation() {
+        let q = U256::from_be_slice(&TEST_Q);
+        let mut kgen = KGenerator::<BeltBlock, U256>::new::<BeltHash>(&X, &H_A, &[], &q);
+
+        // The empty-context fixed vector still holds (first candidate of generation 0).
+        assert_eq!(
+            next_k(&mut kgen),
+            hex!("829614D8 411DBBC4 E1F2471A 40045864 40FD8C95 53FAB6A1 A45CE417 AE97111E")
+        );
+
+        // Drift into another context, then accept the original empty context again.
+        kgen.accept_context::<BeltHash>(&X, &H_B, &DATA_2);
+        assert_eq!(kgen.generation(), 1);
+        let _ = next_k(&mut kgen);
+
+        kgen.accept_context::<BeltHash>(&X, &H_A, &[]);
+        assert_eq!(kgen.generation(), 2);
+
+        // The re-accepted empty context reproduces the exact fixed vector from generation 0.
+        assert_eq!(
+            next_k(&mut kgen),
+            hex!("829614D8 411DBBC4 E1F2471A 40045864 40FD8C95 53FAB6A1 A45CE417 AE97111E")
+        );
+
+        // Re-accepting the very same context is also a well-defined new generation with a reset.
+        kgen.accept_context::<BeltHash>(&X, &H_A, &[]);
+        assert_eq!(kgen.generation(), 3);
+        assert_eq!(
+            next_k(&mut kgen),
+            hex!("829614D8 411DBBC4 E1F2471A 40045864 40FD8C95 53FAB6A1 A45CE417 AE97111E")
+        );
+    }
+
+    #[test]
+    fn failure_recovery_keeps_generation_until_context_changes() {
+        let q = U256::from_be_slice(&TEST_Q);
+        let mut kgen = KGenerator::<BeltBlock, U256>::new::<BeltHash>(&X, &H_A, &DATA_1, &q);
+
+        // Simulate a signer rejecting the first two candidates (e.g. zero `r`) and retrying:
+        // recovery stays inside the generation in progress.
+        let rejected_1 = next_k(&mut kgen);
+        let rejected_2 = next_k(&mut kgen);
+        let accepted = next_k(&mut kgen);
+        assert_eq!(kgen.generation(), 0);
+        assert_ne!(rejected_1, accepted);
+        assert_ne!(rejected_2, accepted);
+
+        // A brand-new signing attempt with a different context gets a clean generation whose
+        // first candidate matches a generator that never saw the failed attempt.
+        kgen.accept_context::<BeltHash>(&X, &H_B, &DATA_2);
+        let mut fresh = KGenerator::<BeltBlock, U256>::new::<BeltHash>(&X, &H_B, &DATA_2, &q);
+        assert_eq!(next_k(&mut kgen), next_k(&mut fresh));
+    }
+
 }

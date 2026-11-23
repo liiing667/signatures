@@ -13,6 +13,23 @@ Digital Signature Algorithm (DSA) and Elliptic Curve Digital Signature Algorithm
 Algorithm described in STB 34.101.45-2013 § 6.3:
 <https://apmi.bsu.by/assets/files/std/bign-spec295.pdf>
 
+## Generation lifecycle
+
+A `KGenerator` organizes candidate production into *generations*:
+
+- `KGenerator::new` accepts the initial context (secret key, message digest and associated
+  data) and starts generation 0.
+- `KGenerator::fill_next_k` produces the next candidate, evolving the internal belt-wbl
+  state. Retries after an unsuitable `k` or a failed signature stay inside the generation in
+  progress.
+- `KGenerator::accept_context` accepts a new context and starts a new generation: the
+  belt-block key is re-derived and the belt-wbl state is reset, so candidates from the previous
+  context are never replayed. `KGenerator::generation` reports the generation in progress.
+
+Reusing one generator across signing attempts without re-accepting the context keeps emitting
+candidates derived from the old state; always call `accept_context` when the message digest or
+the associated data changes.
+
 [Documentation][docs-link]
 
 ## Minimum Supported Rust Version

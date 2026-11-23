@@ -22,7 +22,8 @@ impl<'de> Deserialize<'de> for Signature {
     {
         let mut bytes = [0u8; Signature::BYTE_SIZE];
         serdect::array::deserialize_hex_or_bin(&mut bytes, deserializer)?;
-        Ok(bytes.into())
+        Signature::from_slice(&bytes)
+            .map_err(|_| <D::Error as de::Error>::custom("invalid Ed448 signature encoding"))
     }
 }
 
@@ -63,8 +64,8 @@ impl<'de> serde_bytes::Deserialize<'de> for Signature {
             }
         }
 
-        deserializer
-            .deserialize_bytes(ByteArrayVisitor)
-            .map(Into::into)
+        let bytes: SignatureBytes = deserializer.deserialize_bytes(ByteArrayVisitor)?;
+        Signature::from_slice(&bytes)
+            .map_err(|_| <D::Error as de::Error>::custom("invalid Ed448 signature encoding"))
     }
 }

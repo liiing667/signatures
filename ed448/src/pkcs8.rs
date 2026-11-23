@@ -29,7 +29,7 @@ pub use pkcs8::{
     spki::EncodePublicKey,
 };
 
-use crate::COMPONENT_SIZE;
+use crate::{COMPONENT_SIZE, is_canonical_point};
 use core::fmt;
 
 #[cfg(feature = "zeroize")]
@@ -61,8 +61,9 @@ pub const ALGORITHM_ID: pkcs8::AlgorithmIdentifierRef<'static> = pkcs8::Algorith
 /// -----BEGIN PRIVATE KEY-----
 /// ```
 ///
-/// Note that this type operates on raw bytes and performs no validation that
-/// keys represent valid Ed448 field elements.
+/// Note that this type operates on raw bytes. The PKCS#8 parsing APIs validate
+/// that a present public key is canonically encoded, but perform no other
+/// validation that keys represent valid Ed448 field elements.
 pub struct KeypairBytes {
     /// Ed448 secret key.
     ///
@@ -172,18 +173,28 @@ impl TryFrom<PrivateKeyInfoRef<'_>> for KeypairBytes {
             _ => Err(KeyError::Invalid),
         }?;
 
-        let public_key = private_key
-            .public_key
-            .and_then(|bs| bs.as_bytes())
-            .map(|bytes| bytes.try_into().map_err(|_| KeyError::Invalid))
-            .transpose()?
-            .map(PublicKeyBytes);
+        let public_key = match private_key.public_key {
+            Some(bit_string) => Some(decode_public_key(
+                bit_string.as_bytes().ok_or(KeyError::Invalid)?,
+            )?),
+            None => None,
+        };
 
         Ok(Self {
             secret_key,
             public_key,
         })
     }
+}
+
+fn decode_public_key(bytes: &[u8]) -> core::result::Result<PublicKeyBytes, KeyError> {
+    let bytes: [u8; COMPONENT_SIZE] = bytes.try_into().map_err(|_| KeyError::Invalid)?;
+
+    if !is_canonical_point(&bytes) {
+        return Err(KeyError::Invalid);
+    }
+
+    Ok(PublicKeyBytes(bytes))
 }
 
 impl fmt::Debug for KeypairBytes {
@@ -208,8 +219,9 @@ impl fmt::Debug for KeypairBytes {
 /// -----BEGIN PUBLIC KEY-----
 /// ```
 ///
-/// Note that this type operates on raw bytes and performs no validation that
-/// public keys represent valid compressed Ed448 y-coordinates.
+/// Note that this type operates on raw bytes. The SPKI parsing APIs validate
+/// that the public key is canonically encoded, but perform no other validation
+/// that it represents a valid compressed Ed448 y-coordinate.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct PublicKeyBytes(pub [u8; Self::BYTE_SIZE]);
 
@@ -251,12 +263,18 @@ impl TryFrom<spki::SubjectPublicKeyInfoRef<'_>> for PublicKeyBytes {
             return Err(spki::Error::KeyMalformed);
         }
 
-        spki.subject_public_key
+        let bytes: [u8; Self::BYTE_SIZE] = spki
+            .subject_public_key
             .as_bytes()
             .ok_or(spki::Error::KeyMalformed)?
             .try_into()
-            .map(Self)
-            .map_err(|_| spki::Error::KeyMalformed)
+            .map_err(|_| spki::Error::KeyMalformed)?;
+
+        if !is_canonical_point(&bytes) {
+            return Err(spki::Error::KeyMalformed);
+        }
+
+        Ok(Self(bytes))
     }
 }
 

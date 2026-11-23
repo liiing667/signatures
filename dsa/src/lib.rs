@@ -104,11 +104,51 @@ pub struct Signature {
 
 impl Signature {
     /// Create a new Signature container from its components
+    ///
+    /// This only checks that `r` and `s` are non-zero. It does not know which
+    /// [`Components`] the signature belongs to, so it cannot verify that
+    /// `r < q` and `s < q`. Prefer [`Signature::from_components_with_parameters`]
+    /// which enforces the bounds imposed by the parameter group the signature
+    /// is meant to be verified against.
     #[must_use]
     pub fn from_components(r: BoxedUint, s: BoxedUint) -> Option<Self> {
         let r = NonZero::new(r).into_option()?;
         let s = NonZero::new(s).into_option()?;
         Some(Self { r, s })
+    }
+
+    /// Create a new Signature container from its components, validating that
+    /// both `r` and `s` are in the range required by the given [`Components`].
+    ///
+    /// A DSA signature is only valid for a given parameter group if both of
+    /// its parts are non-zero and strictly smaller than the group's `q`:
+    /// `0 < r < q` and `0 < s < q`. Binding the signature to the parameter
+    /// group at construction time prevents signatures produced for (or
+    /// tampered to fit) a different parameter group from being handed to a
+    /// verification consumer of this group.
+    ///
+    /// # Errors
+    /// Returns [`signature::Error`] if `r` or `s` is zero, or if either is
+    /// equal to or larger than the `q` component of `components`.
+    pub fn from_components_with_parameters(
+        r: BoxedUint,
+        s: BoxedUint,
+        components: &Components,
+    ) -> signature::Result<Self> {
+        let q = components.q();
+
+        let r = NonZero::new(r)
+            .into_option()
+            .ok_or_else(signature::Error::new)?;
+        let s = NonZero::new(s)
+            .into_option()
+            .ok_or_else(signature::Error::new)?;
+
+        if r >= *q || s >= *q {
+            return Err(signature::Error::new());
+        }
+
+        Ok(Self { r, s })
     }
 
     /// Signature part r

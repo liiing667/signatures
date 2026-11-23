@@ -132,6 +132,18 @@ impl Components {
     pub const fn g(&self) -> &NonZero<BoxedUint> {
         &self.g
     }
+
+    /// Check whether two sets of components describe the exact same parameter
+    /// group, i.e. all three of `p`, `q` and `g` are identical.
+    ///
+    /// DSA keys, signatures and verification consumers are only meaningful
+    /// within a single parameter group. This helper is used to ensure objects
+    /// originating from (or imported against) one parameter group cannot be
+    /// silently combined with the parameters of another group.
+    #[must_use]
+    pub fn eq_components(&self, other: &Self) -> bool {
+        self.p == other.p && self.q == other.q && self.g == other.g
+    }
 }
 
 impl Generate for Components {

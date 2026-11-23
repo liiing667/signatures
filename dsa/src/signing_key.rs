@@ -53,13 +53,29 @@ impl SigningKey {
     /// Construct a new private key from the public key and private component.
     ///
     /// # Errors
-    /// Returns an error in the event `x` is zero or equal to or larger than `q`.
+    /// Returns an error if the private component does not belong to the
+    /// parameter group of the given public key, i.e. if `x` is zero,
+    /// `x >= q`, or the public component derived from `x`
+    /// (`g^x mod p`) does not match `verifying_key`.
     pub fn from_components(verifying_key: VerifyingKey, x: BoxedUint) -> signature::Result<Self> {
         let x = NonZero::new(x)
             .into_option()
             .ok_or_else(signature::Error::new)?;
 
-        if x >= *verifying_key.components().q() {
+        let components = verifying_key.components();
+
+        if x >= *components.q() {
+            return Err(signature::Error::new());
+        }
+
+        // Ensure the private component matches the public component within the
+        // same parameter group. This rejects an `x` imported for a different
+        // group (e.g. an `x` smaller than this group's `q` but produced for
+        // another group's `q`, `p` and `g`).
+        let params = BoxedMontyParams::new_vartime(components.p().clone());
+        let g_form = BoxedMontyForm::new((**components.g()).clone(), &params);
+
+        if g_form.pow(&x).retrieve() != **verifying_key.y() {
             return Err(signature::Error::new());
         }
 
@@ -167,13 +183,7 @@ impl SigningKey {
 
         debug_assert_eq!(key_size.n_aligned(), r_short.bits_precision());
         debug_assert_eq!(key_size.n_aligned(), s.bits_precision());
-        let signature = Signature::from_components(r_short, s).ok_or_else(signature::Error::new)?;
-
-        if signature.r() < q && signature.s() < q {
-            Ok(signature)
-        } else {
-            Err(signature::Error::new())
-        }
+        Signature::from_components_with_parameters(r_short, s, components)
     }
 }
 

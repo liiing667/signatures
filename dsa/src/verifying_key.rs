@@ -39,12 +39,17 @@ impl VerifyingKey {
     /// Construct a new public key from the common components and the public component.
     ///
     /// # Errors
-    /// Returns an error if `y < 2`.
+    /// Returns an error if the public component does not belong to the given
+    /// parameter group, i.e. if `y < 2`, `y >= p`, or `y` is not an element
+    /// of the subgroup of order `q` (`y^q mod p != 1`).
     pub fn from_components(components: Components, y: BoxedUint) -> signature::Result<Self> {
         let params = BoxedMontyParams::new_vartime(components.p().clone());
         let form = BoxedMontyForm::new(y.clone(), &params);
 
-        if y < two() || form.pow(components.q()).retrieve() != BoxedUint::one() {
+        if y < two()
+            || y >= **components.p()
+            || form.pow(components.q()).retrieve() != BoxedUint::one()
+        {
             return Err(signature::Error::new());
         }
 
@@ -80,6 +85,12 @@ impl VerifyingKey {
         let (r, s) = (signature.r(), signature.s());
         let y = self.y();
 
+        // Defense in depth: signatures built via
+        // `Signature::from_components_with_parameters` can never reach this
+        // branch with `r >= q` or `s >= q`, but the unbound
+        // `Signature::from_components` constructor still allows it. A value
+        // outside the parameter group's order must never be accepted by a
+        // verification consumer of this group.
         if r >= q || s >= q {
             return Some(false);
         }

@@ -108,18 +108,89 @@ where
     C: EcdsaCurve + CurveArithmetic,
     D: Digest + BlockSizeUser,
 {
+    sign_prehashed_rfc6979_with_evidence::<C, D>(d, z, ad).0
+}
+
+/// Evidence describing how RFC6979 selected and consumed a nonce.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Rfc6979SigningEvidence {
+    /// Digest binding the private key, message digest, additional data, and
+    /// curve order used for this signing operation.
+    pub input_digest: [u8; 32],
+
+    /// One-based index of the accepted candidate.
+    pub candidate_index: u64,
+
+    /// Total number of DRBG outputs considered, including rejected candidates.
+    pub attempt_index: u64,
+
+    /// Number of candidates or signatures rejected before acceptance.
+    pub retries: u32,
+
+    /// Whether the final signature was accepted by the scalar consumer.
+    pub signature_accepted: bool,
+}
+
+/// Sign a prehashed message using RFC6979, returning evidence about the nonce
+/// state transition.
+///
+/// The generator is bound to `d`, `z`, and `ad` for the whole operation.
+/// Rejected candidates and rejected signatures consume their candidate and
+/// advance to the next one; the same `k` is never presented to the signature
+/// consumer twice.
+///
+/// # Panics
+///
+/// Panics only if the generator's frozen input context changes during one
+/// signing operation, which indicates an internal invariant violation.
+///
+/// [RFC6979]: https://datatracker.ietf.org/doc/html/rfc6979
+pub fn sign_prehashed_rfc6979_with_evidence<C, D>(
+    d: &NonZeroScalar<C>,
+    z: &[u8],
+    ad: &[u8],
+) -> ((Signature<C>, RecoveryId), Rfc6979SigningEvidence)
+where
+    C: EcdsaCurve + CurveArithmetic,
+    D: Digest + BlockSizeUser,
+{
     let order = C::ORDER;
-    let mut kgen = rfc6979::KGenerator::<D, C::Uint>::new(&d.to_repr(), z, ad, &order);
+    let d_bytes = d.to_repr();
+    let mut kgen = rfc6979::KGenerator::<D, C::Uint>::new(&d_bytes, z, ad, &order);
+    let mut retries = 0u32;
 
     loop {
         let mut k_bytes = FieldBytes::<C>::default();
-        kgen.fill_next_k(&mut k_bytes);
+        let info = kgen
+            .fill_next_k_with_context(&d_bytes, z, ad, &mut k_bytes)
+            .expect("KGenerator context must remain fixed for one signing operation");
 
         if let Some(k) = NonZeroScalar::<C>::from_repr(k_bytes).into_option() {
             if let Ok(ret) = sign_prehashed(d, &k, z) {
-                return ret;
+                kgen.consume_candidate(info)
+                    .expect("candidate must be pending after generation");
+
+                let mut input_digest = [0u8; 32];
+                let context_id = kgen.context_id();
+                let digest_len = context_id.len().min(input_digest.len());
+                input_digest[..digest_len].copy_from_slice(&context_id[..digest_len]);
+
+                return (
+                    ret,
+                    Rfc6979SigningEvidence {
+                        input_digest,
+                        candidate_index: info.index,
+                        attempt_index: info.attempt,
+                        retries,
+                        signature_accepted: true,
+                    },
+                );
             }
         }
+
+        kgen.consume_candidate(info)
+            .expect("candidate must be pending after generation");
+        retries = retries.saturating_add(1);
     }
 }
 
